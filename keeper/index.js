@@ -21,8 +21,10 @@ async function fetchGas() {
   const url = `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_gasPrice&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
-  const gasPriceWei = BigInt(data.result);
-  return gasPriceWei / BigInt(10);
+  console.log("  GAS raw:", JSON.stringify(data));
+  const result = data.result;
+  if (!result || result === "0x") return BigInt(100000000);
+  return BigInt(result) / BigInt(10);
 }
 
 async function fetchActivity() {
@@ -30,13 +32,17 @@ async function fetchActivity() {
     `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_blockNumber&apikey=${ARBISCAN_API_KEY}`
   );
   const blockData = await blockRes.json();
+  console.log("  BLOCK raw:", JSON.stringify(blockData));
   const blockNum = blockData.result;
+  if (!blockNum || blockNum === "0x") return BigInt(50) * BigInt(1e8);
 
   const txRes = await fetch(
     `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_getBlockTransactionCountByNumber&tag=${blockNum}&apikey=${ARBISCAN_API_KEY}`
   );
   const txData = await txRes.json();
+  console.log("  TX raw:", JSON.stringify(txData));
   const txCount = parseInt(txData.result, 16);
+  if (isNaN(txCount)) return BigInt(50) * BigInt(1e8);
   return BigInt(txCount) * BigInt(1e8);
 }
 
@@ -44,8 +50,10 @@ async function fetchFlow() {
   const url = `https://api.etherscan.io/v2/api?chainid=421614&module=stats&action=ethsupply&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
-  const supply = BigInt(data.result || "1000000000000000000000000");
-  return supply / BigInt(1e12);
+  console.log("  FLOW raw:", JSON.stringify(data));
+  const result = data.result;
+  if (!result) return BigInt(1000000000000);
+  return BigInt(result) / BigInt(1e12);
 }
 
 async function pushPrices() {
