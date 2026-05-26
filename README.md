@@ -72,4 +72,5 @@ CFT (ChainFlux Token) is an internal position receipt token.
 - [ ] Keeper script live
 - [ ] Frontend live on Lovable
 - [ ] Chainlink Automation integration
-- [ ] Mainnet launch
+- [ ] Testnet launch
+- [ ] mainnet launch 🌚
