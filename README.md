@@ -18,7 +18,7 @@ A perpetual trading platform where blockchain activity itself becomes the tradab
 ## How It Works
 
 1. Connect your wallet
-2. Pick a market — GAS, ACTIVITY, or FLOW
+2. Pick a market : GAS, ACTIVITY, or FLOW
 3. Go LONG or SHORT
 4. Close anytime and collect your PnL
 
@@ -49,7 +49,7 @@ See [deployments.md](./deployments.md) for all contract addresses.
 
 ---
 
-## Token — $CFT
+## Token: $CFT
 
 CFT (ChainFlux Token) is an internal position receipt token.
 - Minted when you open a trade
@@ -69,7 +69,7 @@ CFT (ChainFlux Token) is an internal position receipt token.
 
 - [x] Smart contracts deployed
 - [x] Keeper authorized
-- [ ] Keeper script live
+- [x] Keeper script live
 - [ ] Frontend live on Lovable
 - [ ] Chainlink Automation integration
 - [ ] Testnet launch
