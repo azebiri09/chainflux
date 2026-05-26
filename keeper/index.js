@@ -18,7 +18,7 @@ const wallet = new ethers.Wallet(KEEPER_PRIVATE_KEY, provider);
 const contract = new ethers.Contract(PROXY_ADDRESS, ABI, wallet);
 
 async function fetchGas() {
-  const url = `https://api.arbiscan.io/api?module=proxy&action=eth_gasPrice&apikey=${ARBISCAN_API_KEY}`;
+  const url = `https://api.arbiscan.io/v2/api?chainid=421614&module=proxy&action=eth_gasPrice&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
   const gasPriceWei = BigInt(data.result);
@@ -27,13 +27,13 @@ async function fetchGas() {
 
 async function fetchActivity() {
   const blockRes = await fetch(
-    `https://api.arbiscan.io/api?module=proxy&action=eth_blockNumber&apikey=${ARBISCAN_API_KEY}`
+    `https://api.arbiscan.io/v2/api?chainid=421614&module=proxy&action=eth_blockNumber&apikey=${ARBISCAN_API_KEY}`
   );
   const blockData = await blockRes.json();
   const blockNum = blockData.result;
 
   const txRes = await fetch(
-    `https://api.arbiscan.io/api?module=proxy&action=eth_getBlockTransactionCountByNumber&tag=${blockNum}&apikey=${ARBISCAN_API_KEY}`
+    `https://api.arbiscan.io/v2/api?chainid=421614&module=proxy&action=eth_getBlockTransactionCountByNumber&tag=${blockNum}&apikey=${ARBISCAN_API_KEY}`
   );
   const txData = await txRes.json();
   const txCount = parseInt(txData.result, 16);
@@ -41,7 +41,7 @@ async function fetchActivity() {
 }
 
 async function fetchFlow() {
-  const url = `https://api.arbiscan.io/api?module=stats&action=ethsupply&apikey=${ARBISCAN_API_KEY}`;
+  const url = `https://api.arbiscan.io/v2/api?chainid=421614&module=stats&action=ethsupply&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
   const supply = BigInt(data.result || "1000000000000000000000000");
