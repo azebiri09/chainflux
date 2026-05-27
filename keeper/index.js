@@ -17,10 +17,9 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(KEEPER_PRIVATE_KEY, provider);
 const contract = new ethers.Contract(PROXY_ADDRESS, ABI, wallet);
 
-// Track last prices for smooth movement
-let lastGas = BigInt(20000000000000000n); // 0.02
-let lastActivity = BigInt(50000000000000000000n); // 50
-let lastFlow = BigInt(1000000000000000000000n); // 1000
+let lastGas = BigInt("20000000000000000");
+let lastActivity = BigInt("50000000000000000000");
+let lastFlow = BigInt("500000000000000000000");
 
 function applyJitter(last, minPct, maxPct) {
   const pct = minPct + Math.random() * (maxPct - minPct);
@@ -36,12 +35,10 @@ async function fetchGas() {
     const data = await res.json();
     const result = data.result;
     if (!result || result === "0x") throw new Error("bad response");
-    const base = BigInt(result) * BigInt(1e9);
-    // Apply ±8% jitter so price moves
+    const base = BigInt(result) * BigInt(1000000000);
     lastGas = applyJitter(base, -8, 8);
     return lastGas;
   } catch {
-    // If API fails, drift from last known price
     lastGas = applyJitter(lastGas, -5, 5);
     return lastGas;
   }
@@ -55,28 +52,30 @@ async function fetchActivity() {
     const blockData = await blockRes.json();
     const blockNum = parseInt(blockData.result, 16);
     if (isNaN(blockNum)) throw new Error("bad block");
-    const base = ((blockNum % 190) + 10);
-    const jittered = base * (1 + (Math.random() * 0.2 - 0.1)); // ±10%
-    lastActivity = BigInt(Math.floor(jittered)) * BigInt(1e18);
+    const base = (blockNum % 60) + 20;
+    const jittered = base * (1 + (Math.random() * 0.1 - 0.05));
+    lastActivity = BigInt(Math.floor(jittered)) * BigInt("1000000000000000000");
     return lastActivity;
   } catch {
-    lastActivity = applyJitter(lastActivity, -8, 8);
+    lastActivity = applyJitter(lastActivity, -3, 3);
     return lastActivity;
   }
 }
 
 async function fetchFlow() {
   try {
-    const url = `https://api.etherscan.io/v2/api?chainid=421614&module=stats&action=ethsupply&apikey=${ARBISCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const result = data.result;
-    if (!result) throw new Error("no result");
-    const base = BigInt(result) / BigInt(1e12);
-    lastFlow = applyJitter(base, -6, 6);
+    const blockRes = await fetch(
+      `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_blockNumber&apikey=${ARBISCAN_API_KEY}`
+    );
+    const blockData = await blockRes.json();
+    const blockNum = parseInt(blockData.result, 16);
+    if (isNaN(blockNum)) throw new Error("bad block");
+    const base = (blockNum % 900) + 100;
+    const jittered = base * (1 + (Math.random() * 0.12 - 0.06));
+    lastFlow = BigInt(Math.floor(jittered)) * BigInt("1000000000000000000");
     return lastFlow;
   } catch {
-    lastFlow = applyJitter(lastFlow, -6, 6);
+    lastFlow = applyJitter(lastFlow, -5, 5);
     return lastFlow;
   }
 }
