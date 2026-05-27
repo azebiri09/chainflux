@@ -6,7 +6,7 @@ const ARBISCAN_API_KEY = process.env.ARBISCAN_API_KEY;
 const KEEPER_PRIVATE_KEY = process.env.KEEPER_PRIVATE_KEY;
 const PROXY_ADDRESS = "0x615d3801019D33609Eed27EB39D40AB49fa44fAF";
 const RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc";
-const INTERVAL_MS = 24000;
+const INTERVAL_MS = 10000; // ✅ was 24000
 // ────────────────────────────────────────────────────────────────────────────
 
 const ABI = [
@@ -21,10 +21,10 @@ async function fetchGas() {
   const url = `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_gasPrice&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
-  console.log("  GAS raw:", JSON.stringify(data));
   const result = data.result;
-  if (!result || result === "0x") return BigInt(100000000);
-  return BigInt(result) / BigInt(10);
+  if (!result || result === "0x") return BigInt(1e17); // fallback 0.1 gwei in 1e18
+  // result is in wei, scale to 1e18 precision
+  return BigInt(result) * BigInt(1e9); // ✅ wei → 1e18 scaled
 }
 
 async function fetchActivity() {
@@ -32,28 +32,26 @@ async function fetchActivity() {
     `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_blockNumber&apikey=${ARBISCAN_API_KEY}`
   );
   const blockData = await blockRes.json();
-  console.log("  BLOCK raw:", JSON.stringify(blockData));
   const blockNum = blockData.result;
-  if (!blockNum || blockNum === "0x") return BigInt(50) * BigInt(1e8);
+  if (!blockNum || blockNum === "0x") return BigInt(50) * BigInt(1e18);
 
   const txRes = await fetch(
     `https://api.etherscan.io/v2/api?chainid=421614&module=proxy&action=eth_getBlockTransactionCountByNumber&tag=${blockNum}&apikey=${ARBISCAN_API_KEY}`
   );
   const txData = await txRes.json();
-  console.log("  TX raw:", JSON.stringify(txData));
   const txCount = parseInt(txData.result, 16);
-  if (isNaN(txCount)) return BigInt(50) * BigInt(1e8);
-  return BigInt(txCount) * BigInt(1e8);
+  if (isNaN(txCount)) return BigInt(50) * BigInt(1e18);
+  return BigInt(txCount) * BigInt(1e18); // ✅ scale to 1e18
 }
 
 async function fetchFlow() {
   const url = `https://api.etherscan.io/v2/api?chainid=421614&module=stats&action=ethsupply&apikey=${ARBISCAN_API_KEY}`;
   const res = await fetch(url);
   const data = await res.json();
-  console.log("  FLOW raw:", JSON.stringify(data));
   const result = data.result;
-  if (!result) return BigInt(1000000000000);
-  return BigInt(result) / BigInt(1e12);
+  if (!result) return BigInt(1e18); // fallback
+  // result is in wei already, just divide to get a reasonable number
+  return BigInt(result) / BigInt(1e6); // ✅ scale down to 1e18 range
 }
 
 async function pushPrices() {
