@@ -53,67 +53,6 @@ const gasHistory  = [];
 const liqHistory  = [];
 const flowHistory = [];
 
-// ─── BINANCE ETH LIQUIDATION STREAM ─────────────────────────────────────────
-
-const liquidationEvents = [];
-
-const liqWs = new WebSocket(
-  "wss://fstream.binance.com/ws/ethusdt@forceOrder"
-);
-
-liqWs.on("open", async () => {
-  console.log("🟢 Binance liquidation stream connected");
-
-  // Seed with last 1 hour of REST data so we don't start at $0
-  try {
-    const endTime = Date.now();
-    const startTime = endTime - 60 * 60 * 1000;
-    const url = `https://fapi.binance.com/fapi/v1/forceOrders?symbol=ETHUSDT&startTime=${startTime}&endTime=${endTime}&limit=1000`;
-    const res = await fetch(url);
-    const orders = await res.json();
-    if (Array.isArray(orders)) {
-      for (const liq of orders) {
-        const price = parseFloat(liq.averagePrice || "0");
-        const qty = parseFloat(liq.executedQty || "0");
-        if (!price || !qty) continue;
-        liquidationEvents.push({ value: price * qty, ts: liq.time });
-      }
-      console.log(`  Seeded ${orders.length} historical liquidations`);
-    }
-  } catch (err) {
-    console.error("  Liquidation seed error:", err.message);
-  }
-});
-
-liqWs.on("message", (msg) => {
-  try {
-    const payload = JSON.parse(msg);
-
-    // Single order stream: { e: "forceOrder", o: {...} }
-    const order = payload.o;
-    if (!order) return;
-
-    const price = parseFloat(order.ap || order.p || "0");
-    const qty   = parseFloat(order.q || "0");
-    if (!price || !qty) return;
-
-    liquidationEvents.push({
-      value: price * qty,
-      ts: Date.now()
-    });
-  } catch (err) {
-    console.error("Liquidation WS parse error:", err.message);
-  }
-});
-
-liqWs.on("error", (err) => {
-  console.error("Liquidation WS error:", err.message);
-});
-
-liqWs.on("close", () => {
-  console.log("🔴 Liquidation WS disconnected");
-});
-
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function pushToWindow(arr, value, maxLen) {
@@ -159,29 +98,46 @@ async function fetchGas() {
   }
 }
 
-// ─── FETCH LIQUIDATIONS — BINANCE ETH FORCED ORDERS ─────────────────────────
+// ─── FETCH LIQUIDATIONS — DEFILLAMA (no auth needed) ─────────────────────────
+// Uses DeFiLlama liquidations endpoint — public, no API key required
 
 async function fetchLiquidations() {
   try {
-    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    // DeFiLlama liquidations: returns 1h liquidation data per protocol
+    const res  = await fetch("https://api.llama.fi/liquidations/1h");
+    const data = await res.json();
 
-    // Prune old events
-    while (
-      liquidationEvents.length > 0 &&
-      liquidationEvents[0].ts < oneHourAgo
-    ) {
-      liquidationEvents.shift();
+    // Sum all liquidations across all protocols in USD
+    let totalUsd = 0;
+
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        const val = item.liquidationVolumeUSD ?? item.volume ?? item.usd ?? 0;
+        totalUsd += Number(val);
+      }
+    } else if (data && typeof data === "object") {
+      // Sometimes returned as { protocols: [...] } or { data: [...] }
+      const arr = data.protocols ?? data.data ?? data.liquidations ?? [];
+      for (const item of arr) {
+        const val = item.liquidationVolumeUSD ?? item.volume ?? item.usd ?? 0;
+        totalUsd += Number(val);
+      }
     }
 
-    const totalUsd = liquidationEvents.reduce(
-      (sum, liq) => sum + liq.value,
-      0
-    );
+    // Fallback: if still 0 try alternate endpoint
+    if (totalUsd === 0) {
+      const res2  = await fetch("https://api.llama.fi/overview/liquidations");
+      const data2 = await res2.json();
+      const arr2  = data2?.protocols ?? data2?.data ?? [];
+      for (const item of arr2) {
+        totalUsd += Number(item.liquidationVolumeUSD ?? item.volume ?? 0);
+      }
+    }
 
     const normalized = totalUsd / 1_000_000;
-    const scaled = BigInt(Math.round(normalized * 1e18));
+    const scaled     = BigInt(Math.round(normalized * 1e18));
 
-    pushToWindow(liqHistory, scaled, LIQ_WINDOW);
+    pushToWindow(liqHistory, scaled > 0n ? scaled : PRICE_PRECISION, LIQ_WINDOW);
 
     const smoothed = rollingAverage(liqHistory);
 
@@ -196,47 +152,48 @@ async function fetchLiquidations() {
   }
 }
 
-// ─── FETCH STABLECOIN NETFLOWS — 24H CHANGE ──────────────────────────────────
-
-// Store previous reading to compute delta
-let prevStablecoinCirculating = null;
+// ─── FETCH STABLECOIN NETFLOWS — DEFILLAMA 24H CHANGE ────────────────────────
+// Compares current vs 24h-ago circulating supply to get real netflow
 
 async function fetchStablecoinNetflows() {
   try {
-    const res  = await fetch("https://stablecoins.llama.fi/stablecoinchains");
+    // Get per-stablecoin data which includes 24h change
+    const res  = await fetch("https://stablecoins.llama.fi/stablecoins?includePrices=true");
     const data = await res.json();
 
-    const eth = data?.find(
-      c => c.name?.toLowerCase() === "ethereum"
-    );
+    const coins = data?.peggedAssets ?? [];
 
-    const current = eth?.totalCirculatingUSD?.peggedUSD ?? 0;
+    let totalNetflow = 0;
 
-    let netflow = 0;
+    for (const coin of coins) {
+      // Only USDT and USDC on Ethereum
+      const name = coin.symbol?.toUpperCase();
+      if (name !== "USDT" && name !== "USDC") continue;
 
-    if (prevStablecoinCirculating !== null) {
-      // Delta = how much stablecoins changed since last check (10s ago)
-      // Scale up to represent 24h equivalent flow
-      const delta = current - prevStablecoinCirculating;
-      const secondsInDay = 86400;
-      const intervalSeconds = INTERVAL_MS / 1000;
-      netflow = Math.abs(delta) * (secondsInDay / intervalSeconds);
+      const chainData = coin.chainCirculating?.Ethereum;
+      if (!chainData) continue;
+
+      const current = chainData.current?.peggedUSD ?? 0;
+      const prev24h = chainData.circulatingPrevDay?.peggedUSD ?? current;
+
+      totalNetflow += Math.abs(current - prev24h);
     }
 
-    prevStablecoinCirculating = current;
+    // If still 0, fall back to total ETH stablecoin supply as proxy
+    if (totalNetflow === 0) {
+      const res2  = await fetch("https://stablecoins.llama.fi/stablecoinchains");
+      const data2 = await res2.json();
+      const eth   = data2?.find(c => c.name?.toLowerCase() === "ethereum");
+      totalNetflow = eth?.totalCirculatingUSD?.peggedUSD ?? 0;
+    }
 
-    // If no delta yet, fall back to total circulating as baseline
-    const valueToScale = netflow > 0 ? netflow : current;
-
-    const scaled = BigInt(Math.round(valueToScale / 1e6)) * BigInt(1e6);
+    const scaled = BigInt(Math.round(totalNetflow / 1e6)) * BigInt(1e6);
 
     pushToWindow(flowHistory, scaled > 0n ? scaled : PRICE_PRECISION, FLOW_WINDOW);
 
     const smoothed = rollingAverage(flowHistory);
 
-    console.log(
-      `  STABLECOIN NETFLOWS: $${(current / 1e9).toFixed(2)}B total | 24h flow est: $${(netflow / 1e9).toFixed(2)}B | smoothed: ${smoothed}`
-    );
+    console.log(`  STABLECOIN NETFLOWS: 24h delta $${(totalNetflow / 1e6).toFixed(2)}M | smoothed: ${smoothed}`);
 
     return smoothed > 0n ? smoothed : PRICE_PRECISION;
   } catch (err) {
