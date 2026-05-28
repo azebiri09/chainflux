@@ -58,137 +58,114 @@ const flowHistory = [];
 const liquidationEvents = [];
 
 const liqWs = new WebSocket(
-  "wss://fstream.binance.com/ws/!forceOrder@arr"
+  "wss://fstream.binance.com/ws/ethusdt@forceOrder"
 );
 
-liqWs.on("open", () => {
-  console.log(
-    "🟢 Binance liquidation stream connected"
-  );
+liqWs.on("open", async () => {
+  console.log("🟢 Binance liquidation stream connected");
+
+  // Seed with last 1 hour of REST data so we don't start at $0
+  try {
+    const endTime = Date.now();
+    const startTime = endTime - 60 * 60 * 1000;
+    const url = `https://fapi.binance.com/fapi/v1/forceOrders?symbol=ETHUSDT&startTime=${startTime}&endTime=${endTime}&limit=1000`;
+    const res = await fetch(url);
+    const orders = await res.json();
+    if (Array.isArray(orders)) {
+      for (const liq of orders) {
+        const price = parseFloat(liq.averagePrice || "0");
+        const qty = parseFloat(liq.executedQty || "0");
+        if (!price || !qty) continue;
+        liquidationEvents.push({ value: price * qty, ts: liq.time });
+      }
+      console.log(`  Seeded ${orders.length} historical liquidations`);
+    }
+  } catch (err) {
+    console.error("  Liquidation seed error:", err.message);
+  }
 });
 
 liqWs.on("message", (msg) => {
   try {
     const payload = JSON.parse(msg);
 
-    if (!payload.o) return;
+    // Single order stream: { e: "forceOrder", o: {...} }
+    const order = payload.o;
+    if (!order) return;
 
-    const orders = Array.isArray(payload.o)
-      ? payload.o
-      : [payload.o];
+    const price = parseFloat(order.ap || order.p || "0");
+    const qty   = parseFloat(order.q || "0");
+    if (!price || !qty) return;
 
-    for (const liq of orders) {
-      // ETH only
-      if (liq.s !== "ETHUSDT") continue;
-
-      const price =
-        parseFloat(liq.ap || "0");
-
-      const qty =
-        parseFloat(liq.q || "0");
-
-      if (!price || !qty) continue;
-
-      const usdValue = price * qty;
-
-      liquidationEvents.push({
-        value: usdValue,
-        ts: Date.now()
-      });
-    }
+    liquidationEvents.push({
+      value: price * qty,
+      ts: Date.now()
+    });
   } catch (err) {
-    console.error(
-      "Liquidation WS parse error:",
-      err.message
-    );
+    console.error("Liquidation WS parse error:", err.message);
   }
 });
 
 liqWs.on("error", (err) => {
-  console.error(
-    "Liquidation WS error:",
-    err.message
-  );
+  console.error("Liquidation WS error:", err.message);
 });
 
 liqWs.on("close", () => {
-  console.log(
-    "🔴 Liquidation WS disconnected"
-  );
+  console.log("🔴 Liquidation WS disconnected");
 });
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function pushToWindow(arr, value, maxLen) {
   arr.push(value);
-
-  if (arr.length > maxLen) {
-    arr.shift();
-  }
+  if (arr.length > maxLen) arr.shift();
 }
 
 function rollingAverage(arr) {
   if (arr.length === 0) return 0n;
-
-  const sum =
-    arr.reduce((a, b) => a + b, 0n);
-
+  const sum = arr.reduce((a, b) => a + b, 0n);
   return sum / BigInt(arr.length);
 }
 
-// ─── FETCH GAS — ETHEREUM MAINNET ───────────────────────────────────────────
+// ─── FETCH GAS — ETHEREUM MAINNET ────────────────────────────────────────────
 
 async function fetchGas() {
   try {
     const url =
       `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_gasPrice&apikey=${ETHERSCAN_API_KEY}`;
 
-    const res = await fetch(url);
-
+    const res  = await fetch(url);
     const data = await res.json();
 
     if (!data.result || data.result === "0x") {
       throw new Error("bad gas response");
     }
 
-    const rawGwei =
-      Number(BigInt(data.result)) / 1e9;
+    const rawGwei = Number(BigInt(data.result)) / 1e9;
+    const scaled  = BigInt(Math.round(rawGwei * 1e15));
 
-    const scaled =
-      BigInt(Math.round(rawGwei * 1e15));
+    pushToWindow(gasHistory, scaled, GAS_WINDOW);
 
-    pushToWindow(
-      gasHistory,
-      scaled,
-      GAS_WINDOW
-    );
+    const smoothed = rollingAverage(gasHistory);
 
-    const smoothed =
-      rollingAverage(gasHistory);
-
-    console.log(
-      `  GAS raw: ${rawGwei.toFixed(2)} gwei | smoothed: ${smoothed}`
-    );
+    console.log(`  GAS raw: ${rawGwei.toFixed(2)} gwei | smoothed: ${smoothed}`);
 
     return smoothed;
   } catch (err) {
-    console.error(
-      `  GAS fetch error: ${err.message}`
-    );
-
+    console.error(`  GAS fetch error: ${err.message}`);
     return gasHistory.length > 0
       ? rollingAverage(gasHistory)
       : BigInt("20000000000000000");
   }
 }
 
-// ─── FETCH LIQUIDATIONS — BINANCE ETH FORCED ORDERS ────────────────────────
+// ─── FETCH LIQUIDATIONS — BINANCE ETH FORCED ORDERS ─────────────────────────
 
 async function fetchLiquidations() {
   try {
-    const oneHourAgo =
-      Date.now() - 60 * 60 * 1000;
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
 
+    // Prune old events
     while (
       liquidationEvents.length > 0 &&
       liquidationEvents[0].ts < oneHourAgo
@@ -196,152 +173,112 @@ async function fetchLiquidations() {
       liquidationEvents.shift();
     }
 
-    const totalUsd =
-      liquidationEvents.reduce(
-        (sum, liq) => sum + liq.value,
-        0
-      );
-
-    const normalized =
-      totalUsd / 1_000_000;
-
-    const scaled = BigInt(
-      Math.round(normalized * 1e18)
+    const totalUsd = liquidationEvents.reduce(
+      (sum, liq) => sum + liq.value,
+      0
     );
 
-    pushToWindow(
-      liqHistory,
-      scaled,
-      LIQ_WINDOW
-    );
+    const normalized = totalUsd / 1_000_000;
+    const scaled = BigInt(Math.round(normalized * 1e18));
 
-    const smoothed =
-      rollingAverage(liqHistory);
+    pushToWindow(liqHistory, scaled, LIQ_WINDOW);
 
-    console.log(
-      `  LIQUIDATIONS 1h: $${totalUsd.toFixed(0)} | smoothed: ${smoothed}`
-    );
+    const smoothed = rollingAverage(liqHistory);
 
-    return smoothed > 0n
-      ? smoothed
-      : PRICE_PRECISION;
+    console.log(`  LIQUIDATIONS 1h: $${totalUsd.toFixed(0)} | smoothed: ${smoothed}`);
 
+    return smoothed > 0n ? smoothed : PRICE_PRECISION;
   } catch (err) {
-    console.error(
-      `  LIQUIDATIONS fetch error: ${err.message}`
-    );
-
+    console.error(`  LIQUIDATIONS fetch error: ${err.message}`);
     return liqHistory.length > 0
       ? rollingAverage(liqHistory)
       : PRICE_PRECISION;
   }
 }
 
-// ─── FETCH STABLECOIN NETFLOWS — DEFI LLAMA ────────────────────────────────
+// ─── FETCH STABLECOIN NETFLOWS — 24H CHANGE ──────────────────────────────────
+
+// Store previous reading to compute delta
+let prevStablecoinCirculating = null;
 
 async function fetchStablecoinNetflows() {
   try {
-    const res = await fetch(
-      "https://stablecoins.llama.fi/stablecoinchains"
-    );
-
+    const res  = await fetch("https://stablecoins.llama.fi/stablecoinchains");
     const data = await res.json();
 
     const eth = data?.find(
       c => c.name?.toLowerCase() === "ethereum"
     );
 
-    const totalCirculating =
-      eth?.totalCirculatingUSD?.peggedUSD ?? 0;
+    const current = eth?.totalCirculatingUSD?.peggedUSD ?? 0;
 
-    const scaled =
-      totalCirculating > 0
-        ? BigInt(
-            Math.round(totalCirculating / 1e6)
-          ) * BigInt(1e6)
-        : PRICE_PRECISION;
+    let netflow = 0;
 
-    pushToWindow(
-      flowHistory,
-      scaled,
-      FLOW_WINDOW
-    );
+    if (prevStablecoinCirculating !== null) {
+      // Delta = how much stablecoins changed since last check (10s ago)
+      // Scale up to represent 24h equivalent flow
+      const delta = current - prevStablecoinCirculating;
+      const secondsInDay = 86400;
+      const intervalSeconds = INTERVAL_MS / 1000;
+      netflow = Math.abs(delta) * (secondsInDay / intervalSeconds);
+    }
 
-    const smoothed =
-      rollingAverage(flowHistory);
+    prevStablecoinCirculating = current;
+
+    // If no delta yet, fall back to total circulating as baseline
+    const valueToScale = netflow > 0 ? netflow : current;
+
+    const scaled = BigInt(Math.round(valueToScale / 1e6)) * BigInt(1e6);
+
+    pushToWindow(flowHistory, scaled > 0n ? scaled : PRICE_PRECISION, FLOW_WINDOW);
+
+    const smoothed = rollingAverage(flowHistory);
 
     console.log(
-      `  STABLECOIN NETFLOWS: $${(totalCirculating / 1e9).toFixed(2)}B | smoothed: ${smoothed}`
+      `  STABLECOIN NETFLOWS: $${(current / 1e9).toFixed(2)}B total | 24h flow est: $${(netflow / 1e9).toFixed(2)}B | smoothed: ${smoothed}`
     );
 
-    return smoothed > 0n
-      ? smoothed
-      : PRICE_PRECISION;
-
+    return smoothed > 0n ? smoothed : PRICE_PRECISION;
   } catch (err) {
-    console.error(
-      `  STABLECOIN NETFLOWS fetch error: ${err.message}`
-    );
-
+    console.error(`  STABLECOIN NETFLOWS fetch error: ${err.message}`);
     return flowHistory.length > 0
       ? rollingAverage(flowHistory)
       : PRICE_PRECISION;
   }
 }
 
-// ─── MAIN LOOP ──────────────────────────────────────────────────────────────
+// ─── MAIN LOOP ───────────────────────────────────────────────────────────────
 
 async function pushPrices() {
   try {
-    console.log(
-      `[${new Date().toISOString()}] Fetching prices...`
-    );
+    console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const [
-      gas,
-      liquidations,
-      stablecoinNetflows
-    ] = await Promise.all([
+    const [gas, liquidations, stablecoinNetflows] = await Promise.all([
       fetchGas(),
       fetchLiquidations(),
       fetchStablecoinNetflows()
     ]);
 
-    console.log(
-      "  Pushing to chain..."
-    );
+    console.log("  Pushing to chain...");
 
-    const tx =
-      await contract.pushPrices([
-        gas,
-        liquidations,
-        stablecoinNetflows
-      ]);
+    const tx = await contract.pushPrices([
+      gas,
+      liquidations,
+      stablecoinNetflows
+    ]);
 
-    console.log(
-      `  TX sent: ${tx.hash}`
-    );
+    console.log(`  TX sent: ${tx.hash}`);
 
     await tx.wait();
 
-    console.log(
-      "  ✅ Confirmed."
-    );
-
+    console.log("  ✅ Confirmed.");
   } catch (err) {
-    console.error(
-      `  ❌ Error: ${err.message}`
-    );
+    console.error(`  ❌ Error: ${err.message}`);
   }
 }
 
-console.log(
-  "⚡ ChainFlux Keeper V2 starting..."
-);
+console.log("⚡ ChainFlux Keeper V2 starting...");
 
 pushPrices();
 
-setInterval(
-  pushPrices,
-  INTERVAL_MS
-);
+setInterval(pushPrices, INTERVAL_MS);
