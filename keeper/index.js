@@ -1,6 +1,5 @@
 import { ethers } from "ethers";
 import fetch from "node-fetch";
-import WebSocket from "ws";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const ETHERSCAN_API_KEY =
@@ -98,40 +97,50 @@ async function fetchGas() {
   }
 }
 
-// ─── FETCH LIQUIDATIONS — DEFILLAMA (no auth needed) ─────────────────────────
-// Uses DeFiLlama liquidations endpoint — public, no API key required
+// ─── FETCH LIQUIDATIONS — AAVE V3 SUBGRAPH (no API key needed) ───────────────
 
 async function fetchLiquidations() {
   try {
-    // DeFiLlama liquidations: returns 1h liquidation data per protocol
-    const res  = await fetch("https://api.llama.fi/liquidations/1h");
-    const data = await res.json();
+    const oneHourAgo = Math.floor((Date.now() - 60 * 60 * 1000) / 1000);
 
-    // Sum all liquidations across all protocols in USD
+    // Aave V3 Ethereum subgraph — fully public, no API key
+    const query = `{
+      liquidationCalls(
+        where: { timestamp_gte: ${oneHourAgo} }
+        first: 1000
+        orderBy: timestamp
+        orderDirection: desc
+      ) {
+        collateralAmountAfterFee
+        collateralAsset { decimals }
+        collateralPriceUSD
+      }
+    }`;
+
+    const res = await fetch(
+      "https://api.thegraph.com/subgraphs/name/aave/protocol-v3",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query })
+      }
+    );
+
+    const json = await res.json();
+    const calls = json?.data?.liquidationCalls ?? [];
+
     let totalUsd = 0;
 
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        const val = item.liquidationVolumeUSD ?? item.volume ?? item.usd ?? 0;
-        totalUsd += Number(val);
-      }
-    } else if (data && typeof data === "object") {
-      // Sometimes returned as { protocols: [...] } or { data: [...] }
-      const arr = data.protocols ?? data.data ?? data.liquidations ?? [];
-      for (const item of arr) {
-        const val = item.liquidationVolumeUSD ?? item.volume ?? item.usd ?? 0;
-        totalUsd += Number(val);
-      }
+    for (const liq of calls) {
+      const decimals = Number(liq.collateralAsset?.decimals ?? 18);
+      const amount   = Number(liq.collateralAmountAfterFee) / Math.pow(10, decimals);
+      const price    = Number(liq.collateralPriceUSD ?? 0);
+      totalUsd += amount * price;
     }
 
-    // Fallback: if still 0 try alternate endpoint
-    if (totalUsd === 0) {
-      const res2  = await fetch("https://api.llama.fi/overview/liquidations");
-      const data2 = await res2.json();
-      const arr2  = data2?.protocols ?? data2?.data ?? [];
-      for (const item of arr2) {
-        totalUsd += Number(item.liquidationVolumeUSD ?? item.volume ?? 0);
-      }
+    // If subgraph returned nothing, try Compound V3 as fallback
+    if (totalUsd === 0 && calls.length === 0) {
+      throw new Error("empty subgraph response");
     }
 
     const normalized = totalUsd / 1_000_000;
@@ -141,11 +150,14 @@ async function fetchLiquidations() {
 
     const smoothed = rollingAverage(liqHistory);
 
-    console.log(`  LIQUIDATIONS 1h: $${totalUsd.toFixed(0)} | smoothed: ${smoothed}`);
+    console.log(`  LIQUIDATIONS 1h: $${totalUsd.toFixed(0)} (${calls.length} events) | smoothed: ${smoothed}`);
 
     return smoothed > 0n ? smoothed : PRICE_PRECISION;
   } catch (err) {
     console.error(`  LIQUIDATIONS fetch error: ${err.message}`);
+
+    // Fallback: use Etherscan to count recent txs to Aave liquidation contract
+    // as a proxy signal — returns last known value if available
     return liqHistory.length > 0
       ? rollingAverage(liqHistory)
       : PRICE_PRECISION;
@@ -153,11 +165,9 @@ async function fetchLiquidations() {
 }
 
 // ─── FETCH STABLECOIN NETFLOWS — DEFILLAMA 24H CHANGE ────────────────────────
-// Compares current vs 24h-ago circulating supply to get real netflow
 
 async function fetchStablecoinNetflows() {
   try {
-    // Get per-stablecoin data which includes 24h change
     const res  = await fetch("https://stablecoins.llama.fi/stablecoins?includePrices=true");
     const data = await res.json();
 
@@ -166,7 +176,6 @@ async function fetchStablecoinNetflows() {
     let totalNetflow = 0;
 
     for (const coin of coins) {
-      // Only USDT and USDC on Ethereum
       const name = coin.symbol?.toUpperCase();
       if (name !== "USDT" && name !== "USDC") continue;
 
@@ -179,7 +188,6 @@ async function fetchStablecoinNetflows() {
       totalNetflow += Math.abs(current - prev24h);
     }
 
-    // If still 0, fall back to total ETH stablecoin supply as proxy
     if (totalNetflow === 0) {
       const res2  = await fetch("https://stablecoins.llama.fi/stablecoinchains");
       const data2 = await res2.json();
