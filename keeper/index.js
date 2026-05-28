@@ -211,9 +211,7 @@ async function fetchBorrows() {
     // USDC is 6 decimals, WETH is 18 decimals
     // WETH supply dominates — normalize by 1e15 to get a clean ~1e18 range
     const scaled  = totalBorrows / BigInt("1000000000000000");
-    const floored = scaled > PRICE_PRECISION
-      ? scaled
-      : PRICE_PRECISION;
+    const floored = scaled > 0n ? scaled : PRICE_PRECISION;
 
     pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
 
