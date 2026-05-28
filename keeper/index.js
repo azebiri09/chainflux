@@ -45,12 +45,12 @@ const contract =
 // ─── ROLLING AVERAGE WINDOWS ─────────────────────────────────────────────────
 
 const GAS_WINDOW  = 20;
-const LIQ_WINDOW  = 360;
-const FLOW_WINDOW = 8640;
+const LIQ_WINDOW  = 20;
+const TXS_WINDOW  = 20;
 
 const gasHistory  = [];
 const liqHistory  = [];
-const flowHistory = [];
+const txsHistory  = [];
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ function rollingAverage(arr) {
   return sum / BigInt(arr.length);
 }
 
-// ─── FETCH GAS — ETHEREUM MAINNET ────────────────────────────────────────────
+// ─── SLOT 0 — FETCH GAS — ETHEREUM MAINNET ───────────────────────────────────
 
 async function fetchGas() {
   try {
@@ -97,118 +97,84 @@ async function fetchGas() {
   }
 }
 
-// ─── FETCH LIQUIDATIONS — AAVE V3 SUBGRAPH (no API key needed) ───────────────
+// ─── SLOT 1 — FETCH LIQUIDATIONS — AAVE V3 ETHERSCAN EVENT LOGS ──────────────
 
 async function fetchLiquidations() {
   try {
-    const oneHourAgo = Math.floor((Date.now() - 60 * 60 * 1000) / 1000);
+    // Aave V3 Pool on Ethereum mainnet
+    const AAVE_V3_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
+    const LIQ_TOPIC    = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
 
-    // Aave V3 Ethereum subgraph — fully public, no API key
-    const query = `{
-      liquidationCalls(
-        where: { timestamp_gte: ${oneHourAgo} }
-        first: 1000
-        orderBy: timestamp
-        orderDirection: desc
-      ) {
-        collateralAmountAfterFee
-        collateralAsset { decimals }
-        collateralPriceUSD
-      }
-    }`;
-
-    const res = await fetch(
-      "https://api.thegraph.com/subgraphs/name/aave/protocol-v3",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query })
-      }
+    // Look back ~50 blocks (~10 mins on mainnet)
+    const blockRes  = await fetch(
+      `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_blockNumber&apikey=${ETHERSCAN_API_KEY}`
     );
+    const blockData = await blockRes.json();
+    const latestBlock = parseInt(blockData.result, 16);
+    const fromBlock   = latestBlock - 50;
 
-    const json = await res.json();
-    const calls = json?.data?.liquidationCalls ?? [];
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs` +
+      `&address=${AAVE_V3_POOL}` +
+      `&topic0=${LIQ_TOPIC}` +
+      `&fromBlock=${fromBlock}` +
+      `&toBlock=latest` +
+      `&apikey=${ETHERSCAN_API_KEY}`;
 
-    let totalUsd = 0;
+    const res  = await fetch(url);
+    const data = await res.json();
 
-    for (const liq of calls) {
-      const decimals = Number(liq.collateralAsset?.decimals ?? 18);
-      const amount   = Number(liq.collateralAmountAfterFee) / Math.pow(10, decimals);
-      const price    = Number(liq.collateralPriceUSD ?? 0);
-      totalUsd += amount * price;
-    }
+    const events = data?.result ?? [];
+    const count  = Array.isArray(events) ? events.length : 0;
 
-    // If subgraph returned nothing, try Compound V3 as fallback
-    if (totalUsd === 0 && calls.length === 0) {
-      throw new Error("empty subgraph response");
-    }
+    // Scale: count * 1e18, minimum 1e18 so price is never 0
+    const scaled = BigInt(count) * PRICE_PRECISION + PRICE_PRECISION;
 
-    const normalized = totalUsd / 1_000_000;
-    const scaled     = BigInt(Math.round(normalized * 1e18));
-
-    pushToWindow(liqHistory, scaled > 0n ? scaled : PRICE_PRECISION, LIQ_WINDOW);
+    pushToWindow(liqHistory, scaled, LIQ_WINDOW);
 
     const smoothed = rollingAverage(liqHistory);
 
-    console.log(`  LIQUIDATIONS 1h: $${totalUsd.toFixed(0)} (${calls.length} events) | smoothed: ${smoothed}`);
+    console.log(`  LIQUIDATIONS last 50 blocks: ${count} events | smoothed: ${smoothed}`);
 
-    return smoothed > 0n ? smoothed : PRICE_PRECISION;
+    return smoothed;
   } catch (err) {
     console.error(`  LIQUIDATIONS fetch error: ${err.message}`);
-
-    // Fallback: use Etherscan to count recent txs to Aave liquidation contract
-    // as a proxy signal — returns last known value if available
     return liqHistory.length > 0
       ? rollingAverage(liqHistory)
       : PRICE_PRECISION;
   }
 }
 
-// ─── FETCH STABLECOIN NETFLOWS — DEFILLAMA 24H CHANGE ────────────────────────
+// ─── SLOT 2 — FETCH ETH TXS PER BLOCK ────────────────────────────────────────
 
-async function fetchStablecoinNetflows() {
+async function fetchTxsPerBlock() {
   try {
-    const res  = await fetch("https://stablecoins.llama.fi/stablecoins?includePrices=true");
+    const url =
+      `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=false&apikey=${ETHERSCAN_API_KEY}`;
+
+    const res  = await fetch(url);
     const data = await res.json();
 
-    const coins = data?.peggedAssets ?? [];
+    const txs   = data?.result?.transactions ?? [];
+    const count = txs.length;
 
-    let totalNetflow = 0;
+    if (count === 0) throw new Error("empty block or bad response");
 
-    for (const coin of coins) {
-      const name = coin.symbol?.toUpperCase();
-      if (name !== "USDT" && name !== "USDC") continue;
+    // Typical range 150–250 txs. Scale to 1e18 range.
+    // Multiply count by 1e16 so 200 txs ≈ 2e18 — a clean readable price
+    const scaled = BigInt(count) * BigInt("10000000000000000");
 
-      const chainData = coin.chainCirculating?.Ethereum;
-      if (!chainData) continue;
+    pushToWindow(txsHistory, scaled, TXS_WINDOW);
 
-      const current = chainData.current?.peggedUSD ?? 0;
-      const prev24h = chainData.circulatingPrevDay?.peggedUSD ?? current;
+    const smoothed = rollingAverage(txsHistory);
 
-      totalNetflow += Math.abs(current - prev24h);
-    }
+    console.log(`  TXS PER BLOCK: ${count} txs | smoothed: ${smoothed}`);
 
-    if (totalNetflow === 0) {
-      const res2  = await fetch("https://stablecoins.llama.fi/stablecoinchains");
-      const data2 = await res2.json();
-      const eth   = data2?.find(c => c.name?.toLowerCase() === "ethereum");
-      totalNetflow = eth?.totalCirculatingUSD?.peggedUSD ?? 0;
-    }
-
-    const scaled = BigInt(Math.round(totalNetflow / 1e6)) * BigInt(1e6);
-
-    pushToWindow(flowHistory, scaled > 0n ? scaled : PRICE_PRECISION, FLOW_WINDOW);
-
-    const smoothed = rollingAverage(flowHistory);
-
-    console.log(`  STABLECOIN NETFLOWS: 24h delta $${(totalNetflow / 1e6).toFixed(2)}M | smoothed: ${smoothed}`);
-
-    return smoothed > 0n ? smoothed : PRICE_PRECISION;
+    return smoothed;
   } catch (err) {
-    console.error(`  STABLECOIN NETFLOWS fetch error: ${err.message}`);
-    return flowHistory.length > 0
-      ? rollingAverage(flowHistory)
-      : PRICE_PRECISION;
+    console.error(`  TXS PER BLOCK fetch error: ${err.message}`);
+    return txsHistory.length > 0
+      ? rollingAverage(txsHistory)
+      : BigInt("2000000000000000000");
   }
 }
 
@@ -218,10 +184,10 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const [gas, liquidations, stablecoinNetflows] = await Promise.all([
+    const [gas, liquidations, txsPerBlock] = await Promise.all([
       fetchGas(),
       fetchLiquidations(),
-      fetchStablecoinNetflows()
+      fetchTxsPerBlock()
     ]);
 
     console.log("  Pushing to chain...");
@@ -229,7 +195,7 @@ async function pushPrices() {
     const tx = await contract.pushPrices([
       gas,
       liquidations,
-      stablecoinNetflows
+      txsPerBlock
     ]);
 
     console.log(`  TX sent: ${tx.hash}`);
