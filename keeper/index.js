@@ -62,17 +62,19 @@ async function fetchGas() {
 // ─── FETCH LIQUIDATIONS — DeFiLlama ──────────────────────────────────────────
 async function fetchLiquidations() {
   try {
-    const res  = await fetch("https://defillama-datasets.llama.fi/liquidity/1h.json");
+    const res  = await fetch("https://api.llama.fi/overview/liquidations");
     const data = await res.json();
 
-    const total  = data?.data?.ethereum?.total ?? 0;
+    const eth   = data?.chains?.find(c => c.chain?.toLowerCase() === "ethereum");
+    const total = eth?.liquidated24h ?? 0;
+
     const scaled = total > 0
       ? BigInt(Math.round(total)) * PRICE_PRECISION
       : PRICE_PRECISION;
 
     pushToWindow(liqHistory, scaled, LIQ_WINDOW);
     const smoothed = rollingAverage(liqHistory);
-    console.log(`  LIQUIDATIONS total: $${total} | smoothed: ${smoothed}`);
+    console.log(`  LIQUIDATIONS 24h: $${total} | smoothed: ${smoothed}`);
     return smoothed > 0n ? smoothed : PRICE_PRECISION;
   } catch (err) {
     console.error(`  LIQUIDATIONS fetch error: ${err.message}`);
