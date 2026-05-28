@@ -15,10 +15,10 @@ const PROXY_ADDRESS =
 const RPC_URL =
   "https://sepolia-rollup.arbitrum.io/rpc";
 
-const INTERVAL_MS = 15000; // increased to 15s to respect rate limits
+const INTERVAL_MS = 15000;
 
 const PRICE_PRECISION =
-  BigInt("1000000000000000000");
+  BigInt("1000000000000000000"); // 1e18
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -83,7 +83,6 @@ async function ethCall(to, data) {
   const res  = await fetch(url);
   const json = await res.json();
 
-  // Catch rate limit messages before trying BigInt conversion
   if (
     !json.result ||
     json.result === "0x" ||
@@ -101,7 +100,7 @@ async function ethCall(to, data) {
   return json.result;
 }
 
-// ─── SLOT 0 — FETCH GAS — ETHEREUM MAINNET ───────────────────────────────────
+// ─── SLOT 0 — GAS (gwei, stored as gwei * 1e18) ──────────────────────────────
 
 async function fetchGas() {
   try {
@@ -120,36 +119,33 @@ async function fetchGas() {
       throw new Error("bad gas response");
     }
 
+    // Convert wei to gwei, then store as gwei * 1e18
+    // e.g. 0.22 gwei → scaled = 220000000000000000 → frontend: 220000000000000000 / 1e18 = 0.22
     const rawGwei = Number(BigInt(data.result)) / 1e9;
-    const scaled  = BigInt(Math.round(rawGwei * 1e15));
+    const scaled  = BigInt(Math.round(rawGwei * 1e18));
 
     pushToWindow(gasHistory, scaled, GAS_WINDOW);
 
     const smoothed = rollingAverage(gasHistory);
 
-    console.log(`  GAS raw: ${rawGwei.toFixed(2)} gwei | smoothed: ${smoothed}`);
+    console.log(`  GAS raw: ${rawGwei.toFixed(4)} gwei | smoothed: ${smoothed}`);
 
     return smoothed;
   } catch (err) {
     console.error(`  GAS fetch error: ${err.message}`);
     return gasHistory.length > 0
       ? rollingAverage(gasHistory)
-      : BigInt("20000000000000000");
+      : BigInt("220000000000000000"); // fallback: 0.22 gwei
   }
 }
 
-// ─── SLOT 1 — FETCH AAVE V3 TOTAL BORROWS ────────────────────────────────────
-// Step 1: resolve variableDebt token address dynamically from Data Provider
-// Step 2: call totalSupply() on that address
-// USDC + WETH only — WBTC Aave liquidity too low, often returns empty
-// 400ms delay between calls to avoid Etherscan 3/sec rate limit
+// ─── SLOT 1 — AAVE BORROWS (stored as billion USD * 1e18) ────────────────────
 
 const AAVE_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3";
 
 const GET_RESERVE_TOKENS_SIG = "0xd2493b6c";
 const TOTAL_SUPPLY_SIG       = "0x18160ddd";
 
-// USDC and WETH only — most reliable, dominate borrow volume
 const BORROW_ASSETS = [
   { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", symbol: "USDC" },
   { address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH" },
@@ -162,17 +158,11 @@ async function fetchBorrows() {
 
     for (const asset of BORROW_ASSETS) {
       try {
-        // Delay between each asset to avoid rate limiting
         if (successCount > 0) await sleep(400);
 
-        // Step 1 — resolve live variableDebt token address
         const paddedAsset    = asset.address.slice(2).toLowerCase().padStart(64, "0");
         const reserveResult  = await ethCall(AAVE_DATA_PROVIDER, GET_RESERVE_TOKENS_SIG + paddedAsset);
 
-        // getReserveTokensAddresses returns:
-        // [0] aTokenAddress
-        // [1] stableDebtTokenAddress
-        // [2] variableDebtTokenAddress  ← slot 2
         const hex = reserveResult.slice(2);
         const variableDebtAddress = "0x" + hex.slice(2 * 64, 3 * 64).slice(24);
 
@@ -184,8 +174,7 @@ async function fetchBorrows() {
           continue;
         }
 
-        // Step 2 — totalSupply() on live variableDebt token
-        await sleep(400); // extra delay before second call
+        await sleep(400);
         const supplyResult = await ethCall(variableDebtAddress, TOTAL_SUPPLY_SIG);
         const supply       = BigInt(supplyResult);
 
@@ -208,9 +197,10 @@ async function fetchBorrows() {
       throw new Error("all asset calls failed or returned zero");
     }
 
-    // USDC is 6 decimals, WETH is 18 decimals
-    // WETH supply dominates — normalize by 1e15 to get a clean ~1e18 range
-    const scaled  = totalBorrows / BigInt("1000000000000000");
+    // totalBorrows is dominated by WETH (18 decimals) in the 1e24 range
+    // Divide by 1e6 to get a number in the billions range, then * 1e18 for frontend
+    // e.g. totalBorrows ~1.5e24 → / 1e6 = 1.5e18 → frontend: 1.5e18 / 1e18 = 1.5 billion
+    const scaled  = (totalBorrows * PRICE_PRECISION) / BigInt("1000000000000000000000000");
     const floored = scaled > 0n ? scaled : PRICE_PRECISION;
 
     pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
@@ -229,7 +219,7 @@ async function fetchBorrows() {
   }
 }
 
-// ─── SLOT 2 — FETCH ETH TXS PER BLOCK ────────────────────────────────────────
+// ─── SLOT 2 — TXS PER BLOCK (stored as count * 1e18) ─────────────────────────
 
 async function fetchTxsPerBlock() {
   try {
@@ -244,7 +234,9 @@ async function fetchTxsPerBlock() {
 
     if (count === 0) throw new Error("empty block or bad response");
 
-    const scaled = BigInt(count) * BigInt("10000000000000000");
+    // Store as count * 1e18 so frontend gets back the raw tx count
+    // e.g. 204 txs → scaled = 204 * 1e18 → frontend: 204e18 / 1e18 = 204
+    const scaled = BigInt(count) * PRICE_PRECISION;
 
     pushToWindow(txsHistory, scaled, TXS_WINDOW);
 
@@ -257,7 +249,7 @@ async function fetchTxsPerBlock() {
     console.error(`  TXS PER BLOCK fetch error: ${err.message}`);
     return txsHistory.length > 0
       ? rollingAverage(txsHistory)
-      : BigInt("2000000000000000000");
+      : BigInt("200000000000000000000"); // fallback: 200 txs
   }
 }
 
@@ -267,7 +259,6 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    // Sequential fetches to avoid rate limiting — not Promise.all
     const gas        = await fetchGas();
     await sleep(400);
     const borrows    = await fetchBorrows();
