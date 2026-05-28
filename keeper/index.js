@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
 import fetch from "node-fetch";
+import http from "http";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const ETHERSCAN_API_KEY =
@@ -41,6 +42,15 @@ const contract =
     ABI,
     wallet
   );
+
+// ─── PRICE CACHE (served via HTTP) ───────────────────────────────────────────
+
+let latestPrices = {
+  GAS: 0,
+  AAVE_BORROWS: 0,
+  TXS_PER_BLOCK: 0,
+  updatedAt: 0,
+};
 
 // ─── ROLLING AVERAGE WINDOWS ─────────────────────────────────────────────────
 
@@ -100,7 +110,7 @@ async function ethCall(to, data) {
   return json.result;
 }
 
-// ─── SLOT 0 — GAS (gwei, stored as gwei * 1e18) ──────────────────────────────
+// ─── SLOT 0 — GAS ────────────────────────────────────────────────────────────
 
 async function fetchGas() {
   try {
@@ -119,8 +129,6 @@ async function fetchGas() {
       throw new Error("bad gas response");
     }
 
-    // Convert wei to gwei, then store as gwei * 1e18
-    // e.g. 0.22 gwei → scaled = 220000000000000000 → frontend: 220000000000000000 / 1e18 = 0.22
     const rawGwei = Number(BigInt(data.result)) / 1e9;
     const scaled  = BigInt(Math.round(rawGwei * 1e18));
 
@@ -135,11 +143,11 @@ async function fetchGas() {
     console.error(`  GAS fetch error: ${err.message}`);
     return gasHistory.length > 0
       ? rollingAverage(gasHistory)
-      : BigInt("220000000000000000"); // fallback: 0.22 gwei
+      : BigInt("220000000000000000");
   }
 }
 
-// ─── SLOT 1 — AAVE BORROWS (stored as billion USD * 1e18) ────────────────────
+// ─── SLOT 1 — AAVE BORROWS ───────────────────────────────────────────────────
 
 const AAVE_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3";
 
@@ -197,9 +205,6 @@ async function fetchBorrows() {
       throw new Error("all asset calls failed or returned zero");
     }
 
-    // totalBorrows is dominated by WETH (18 decimals) in the 1e24 range
-    // Divide by 1e6 to get a number in the billions range, then * 1e18 for frontend
-    // e.g. totalBorrows ~1.5e24 → / 1e6 = 1.5e18 → frontend: 1.5e18 / 1e18 = 1.5 billion
     const scaled  = (totalBorrows * PRICE_PRECISION) / BigInt("1000000000000000000000000");
     const floored = scaled > 0n ? scaled : PRICE_PRECISION;
 
@@ -219,7 +224,7 @@ async function fetchBorrows() {
   }
 }
 
-// ─── SLOT 2 — TXS PER BLOCK (stored as count * 1e18) ─────────────────────────
+// ─── SLOT 2 — TXS PER BLOCK ──────────────────────────────────────────────────
 
 async function fetchTxsPerBlock() {
   try {
@@ -234,8 +239,6 @@ async function fetchTxsPerBlock() {
 
     if (count === 0) throw new Error("empty block or bad response");
 
-    // Store as count * 1e18 so frontend gets back the raw tx count
-    // e.g. 204 txs → scaled = 204 * 1e18 → frontend: 204e18 / 1e18 = 204
     const scaled = BigInt(count) * PRICE_PRECISION;
 
     pushToWindow(txsHistory, scaled, TXS_WINDOW);
@@ -249,7 +252,7 @@ async function fetchTxsPerBlock() {
     console.error(`  TXS PER BLOCK fetch error: ${err.message}`);
     return txsHistory.length > 0
       ? rollingAverage(txsHistory)
-      : BigInt("200000000000000000000"); // fallback: 200 txs
+      : BigInt("200000000000000000000");
   }
 }
 
@@ -259,9 +262,9 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const gas        = await fetchGas();
+    const gas         = await fetchGas();
     await sleep(400);
-    const borrows    = await fetchBorrows();
+    const borrows     = await fetchBorrows();
     await sleep(400);
     const txsPerBlock = await fetchTxsPerBlock();
 
@@ -278,10 +281,33 @@ async function pushPrices() {
     await tx.wait();
 
     console.log("  ✅ Confirmed.");
+
+    // ── Update price cache after confirmed push ──
+    latestPrices = {
+      GAS:          Number(gas)         / 1e18,
+      AAVE_BORROWS: Number(borrows)     / 1e18,
+      TXS_PER_BLOCK: Number(txsPerBlock) / 1e18,
+      updatedAt:    Date.now(),
+    };
+
+    console.log(`  📡 Cache updated: GAS=${latestPrices.GAS} | BORROWS=${latestPrices.AAVE_BORROWS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
+
   } catch (err) {
     console.error(`  ❌ Error: ${err.message}`);
   }
 }
+
+// ─── HTTP PRICE SERVER ───────────────────────────────────────────────────────
+
+http.createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(latestPrices));
+}).listen(process.env.PORT || 3000, () => {
+  console.log(`📡 Price API listening on port ${process.env.PORT || 3000}`);
+});
+
+// ─── START ───────────────────────────────────────────────────────────────────
 
 console.log("⚡ ChainFlux Keeper V2 starting...");
 
