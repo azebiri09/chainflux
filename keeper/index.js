@@ -44,9 +44,9 @@ const contract =
 
 // ─── ROLLING AVERAGE WINDOWS ─────────────────────────────────────────────────
 
-const GAS_WINDOW    = 20;
+const GAS_WINDOW     = 20;
 const BORROWS_WINDOW = 20;
-const TXS_WINDOW    = 20;
+const TXS_WINDOW     = 20;
 
 const gasHistory     = [];
 const borrowsHistory = [];
@@ -98,64 +98,80 @@ async function fetchGas() {
 }
 
 // ─── SLOT 1 — FETCH AAVE V3 TOTAL BORROWS ────────────────────────────────────
-// Calls getReserveData() for USDC, WETH, WBTC on Aave V3 Pool
-// Sums totalVariableDebt across all 3 assets
-// Scaled down to a tradable range then smoothed
+// Uses AaveProtocolDataProvider (0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3)
+// Calls getReserveData(asset) — index 4 in the returned tuple is totalVariableDebt
+// Assets: USDC, WETH, WBTC — top 3 by borrow volume
 
-const AAVE_V3_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
+const AAVE_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3";
 
-// getReserveData(address asset) returns tuple — index 2 is totalVariableDebt (uint256)
-const RESERVE_DATA_SIG = "0x35ea6a75";
+// getReserveData(address) selector
+const GET_RESERVE_DATA_SIG = "0x35ea6a75";
 
-// Top 3 assets by borrow volume on Aave V3 mainnet
 const ASSETS = [
-  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-  "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC  (6 decimals)
+  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH  (18 decimals)
+  "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC  (8 decimals)
 ];
 
 async function fetchBorrows() {
   try {
     let totalBorrows = 0n;
+    let successCount = 0;
 
     for (const asset of ASSETS) {
-      // Encode call: getReserveData(address)
-      const paddedAsset = asset.slice(2).toLowerCase().padStart(64, "0");
-      const callData    = RESERVE_DATA_SIG + paddedAsset;
+      try {
+        const paddedAsset = asset.slice(2).toLowerCase().padStart(64, "0");
+        const callData    = GET_RESERVE_DATA_SIG + paddedAsset;
 
-      const url = `https://api.etherscan.io/v2/api?chainid=1` +
-        `&module=proxy&action=eth_call` +
-        `&to=${AAVE_V3_POOL}` +
-        `&data=${callData}` +
-        `&tag=latest` +
-        `&apikey=${ETHERSCAN_API_KEY}`;
+        const url =
+          `https://api.etherscan.io/v2/api?chainid=1` +
+          `&module=proxy&action=eth_call` +
+          `&to=${AAVE_DATA_PROVIDER}` +
+          `&data=${callData}` +
+          `&tag=latest` +
+          `&apikey=${ETHERSCAN_API_KEY}`;
 
-      const res  = await fetch(url);
-      const data = await res.json();
+        const res  = await fetch(url);
+        const data = await res.json();
 
-      if (!data.result || data.result === "0x") continue;
+        if (!data.result || data.result === "0x" || data.result.length < 10) {
+          console.warn(`  BORROWS: skipping asset ${asset} — empty result`);
+          continue;
+        }
 
-      // Result is ABI-encoded tuple. totalVariableDebt is at word index 2 (bytes 64–128)
-      const hex             = data.result.slice(2);
-      const totalVariableDebt = BigInt("0x" + hex.slice(128, 192));
+        // Tuple returned:
+        // [0] unbacked
+        // [1] accruedToTreasuryScaled
+        // [2] totalAToken
+        // [3] totalStableDebt
+        // [4] totalVariableDebt  <── we want this
+        const hex = data.result.slice(2);
+        const totalVariableDebt = BigInt("0x" + hex.slice(4 * 64, 5 * 64));
 
-      totalBorrows += totalVariableDebt;
+        totalBorrows += totalVariableDebt;
+        successCount++;
+      } catch (innerErr) {
+        console.warn(`  BORROWS: asset ${asset} error — ${innerErr.message}`);
+      }
     }
 
-    if (totalBorrows === 0n) throw new Error("zero borrows — bad response");
+    if (successCount === 0 || totalBorrows === 0n) {
+      throw new Error("all asset calls failed or returned zero");
+    }
 
-    // totalBorrows is in token base units (6 decimals USDC, 18 WETH/WBTC)
-    // Scale down to a tradable range: divide by 1e24 so number sits around 1e18
-    const scaled = totalBorrows / BigInt("1000000000000000000000000");
-
-    // Floor at 1 to never push 0
+    // Normalize decimals roughly:
+    // USDC is 6 decimals → totalVariableDebt in microdollars (huge number)
+    // WETH is 18 decimals → totalVariableDebt in wei
+    // WBTC is 8 decimals → totalVariableDebt in satoshis
+    // Divide by 1e20 to bring into a ~1e18 tradable range
+    const scaled  = totalBorrows / BigInt("100000000000000000000");
     const floored = scaled > 0n ? scaled : PRICE_PRECISION;
 
     pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
 
     const smoothed = rollingAverage(borrowsHistory);
 
-    console.log(`  AAVE BORROWS raw: ${totalBorrows} | scaled: ${floored} | smoothed: ${smoothed}`);
+    console.log(`  AAVE BORROWS total: ${totalBorrows} | scaled: ${floored} | smoothed: ${smoothed}`);
 
     return smoothed;
   } catch (err) {
