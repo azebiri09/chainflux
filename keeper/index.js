@@ -44,13 +44,13 @@ const contract =
 
 // ─── ROLLING AVERAGE WINDOWS ─────────────────────────────────────────────────
 
-const GAS_WINDOW  = 20;
-const LIQ_WINDOW  = 20;
-const TXS_WINDOW  = 20;
+const GAS_WINDOW    = 20;
+const BORROWS_WINDOW = 20;
+const TXS_WINDOW    = 20;
 
-const gasHistory  = [];
-const liqHistory  = [];
-const txsHistory  = [];
+const gasHistory     = [];
+const borrowsHistory = [];
+const txsHistory     = [];
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -97,49 +97,71 @@ async function fetchGas() {
   }
 }
 
-// ─── SLOT 1 — FETCH LIQUIDATIONS — AAVE V3 ETHERSCAN EVENT LOGS ──────────────
+// ─── SLOT 1 — FETCH AAVE V3 TOTAL BORROWS ────────────────────────────────────
+// Calls getReserveData() for USDC, WETH, WBTC on Aave V3 Pool
+// Sums totalVariableDebt across all 3 assets
+// Scaled down to a tradable range then smoothed
 
-async function fetchLiquidations() {
+const AAVE_V3_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
+
+// getReserveData(address asset) returns tuple — index 2 is totalVariableDebt (uint256)
+const RESERVE_DATA_SIG = "0x35ea6a75";
+
+// Top 3 assets by borrow volume on Aave V3 mainnet
+const ASSETS = [
+  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
+  "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
+];
+
+async function fetchBorrows() {
   try {
-    // Aave V3 Pool on Ethereum mainnet
-    const AAVE_V3_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
-    const LIQ_TOPIC    = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
+    let totalBorrows = 0n;
 
-    // Look back ~50 blocks (~10 mins on mainnet)
-    const blockRes  = await fetch(
-      `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_blockNumber&apikey=${ETHERSCAN_API_KEY}`
-    );
-    const blockData = await blockRes.json();
-    const latestBlock = parseInt(blockData.result, 16);
-    const fromBlock   = latestBlock - 50;
+    for (const asset of ASSETS) {
+      // Encode call: getReserveData(address)
+      const paddedAsset = asset.slice(2).toLowerCase().padStart(64, "0");
+      const callData    = RESERVE_DATA_SIG + paddedAsset;
 
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs` +
-      `&address=${AAVE_V3_POOL}` +
-      `&topic0=${LIQ_TOPIC}` +
-      `&fromBlock=${fromBlock}` +
-      `&toBlock=latest` +
-      `&apikey=${ETHERSCAN_API_KEY}`;
+      const url = `https://api.etherscan.io/v2/api?chainid=1` +
+        `&module=proxy&action=eth_call` +
+        `&to=${AAVE_V3_POOL}` +
+        `&data=${callData}` +
+        `&tag=latest` +
+        `&apikey=${ETHERSCAN_API_KEY}`;
 
-    const res  = await fetch(url);
-    const data = await res.json();
+      const res  = await fetch(url);
+      const data = await res.json();
 
-    const events = data?.result ?? [];
-    const count  = Array.isArray(events) ? events.length : 0;
+      if (!data.result || data.result === "0x") continue;
 
-    // Scale: count * 1e18, minimum 1e18 so price is never 0
-    const scaled = BigInt(count) * PRICE_PRECISION + PRICE_PRECISION;
+      // Result is ABI-encoded tuple. totalVariableDebt is at word index 2 (bytes 64–128)
+      const hex             = data.result.slice(2);
+      const totalVariableDebt = BigInt("0x" + hex.slice(128, 192));
 
-    pushToWindow(liqHistory, scaled, LIQ_WINDOW);
+      totalBorrows += totalVariableDebt;
+    }
 
-    const smoothed = rollingAverage(liqHistory);
+    if (totalBorrows === 0n) throw new Error("zero borrows — bad response");
 
-    console.log(`  LIQUIDATIONS last 50 blocks: ${count} events | smoothed: ${smoothed}`);
+    // totalBorrows is in token base units (6 decimals USDC, 18 WETH/WBTC)
+    // Scale down to a tradable range: divide by 1e24 so number sits around 1e18
+    const scaled = totalBorrows / BigInt("1000000000000000000000000");
+
+    // Floor at 1 to never push 0
+    const floored = scaled > 0n ? scaled : PRICE_PRECISION;
+
+    pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
+
+    const smoothed = rollingAverage(borrowsHistory);
+
+    console.log(`  AAVE BORROWS raw: ${totalBorrows} | scaled: ${floored} | smoothed: ${smoothed}`);
 
     return smoothed;
   } catch (err) {
-    console.error(`  LIQUIDATIONS fetch error: ${err.message}`);
-    return liqHistory.length > 0
-      ? rollingAverage(liqHistory)
+    console.error(`  AAVE BORROWS fetch error: ${err.message}`);
+    return borrowsHistory.length > 0
+      ? rollingAverage(borrowsHistory)
       : PRICE_PRECISION;
   }
 }
@@ -159,8 +181,6 @@ async function fetchTxsPerBlock() {
 
     if (count === 0) throw new Error("empty block or bad response");
 
-    // Typical range 150–250 txs. Scale to 1e18 range.
-    // Multiply count by 1e16 so 200 txs ≈ 2e18 — a clean readable price
     const scaled = BigInt(count) * BigInt("10000000000000000");
 
     pushToWindow(txsHistory, scaled, TXS_WINDOW);
@@ -184,9 +204,9 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const [gas, liquidations, txsPerBlock] = await Promise.all([
+    const [gas, borrows, txsPerBlock] = await Promise.all([
       fetchGas(),
-      fetchLiquidations(),
+      fetchBorrows(),
       fetchTxsPerBlock()
     ]);
 
@@ -194,7 +214,7 @@ async function pushPrices() {
 
     const tx = await contract.pushPrices([
       gas,
-      liquidations,
+      borrows,
       txsPerBlock
     ]);
 
