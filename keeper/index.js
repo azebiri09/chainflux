@@ -15,7 +15,7 @@ const PROXY_ADDRESS =
 const RPC_URL =
   "https://sepolia-rollup.arbitrum.io/rpc";
 
-const INTERVAL_MS = 10000;
+const INTERVAL_MS = 15000; // increased to 15s to respect rate limits
 
 const PRICE_PRECISION =
   BigInt("1000000000000000000");
@@ -65,6 +65,42 @@ function rollingAverage(arr) {
   return sum / BigInt(arr.length);
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─── ETHERSCAN CALL HELPER ────────────────────────────────────────────────────
+
+async function ethCall(to, data) {
+  const url =
+    `https://api.etherscan.io/v2/api?chainid=1` +
+    `&module=proxy&action=eth_call` +
+    `&to=${to}` +
+    `&data=${data}` +
+    `&tag=latest` +
+    `&apikey=${ETHERSCAN_API_KEY}`;
+
+  const res  = await fetch(url);
+  const json = await res.json();
+
+  // Catch rate limit messages before trying BigInt conversion
+  if (
+    !json.result ||
+    json.result === "0x" ||
+    json.result.length < 10 ||
+    typeof json.result !== "string" ||
+    !json.result.startsWith("0x")
+  ) {
+    throw new Error(
+      `bad response: ${typeof json.result === "string"
+        ? json.result.slice(0, 60)
+        : JSON.stringify(json.result)}`
+    );
+  }
+
+  return json.result;
+}
+
 // ─── SLOT 0 — FETCH GAS — ETHEREUM MAINNET ───────────────────────────────────
 
 async function fetchGas() {
@@ -75,7 +111,12 @@ async function fetchGas() {
     const res  = await fetch(url);
     const data = await res.json();
 
-    if (!data.result || data.result === "0x") {
+    if (
+      !data.result ||
+      data.result === "0x" ||
+      typeof data.result !== "string" ||
+      !data.result.startsWith("0x")
+    ) {
       throw new Error("bad gas response");
     }
 
@@ -98,92 +139,68 @@ async function fetchGas() {
 }
 
 // ─── SLOT 1 — FETCH AAVE V3 TOTAL BORROWS ────────────────────────────────────
-// Dynamic resolution: fetch variableDebt token addresses live from Aave Pool
-// then call totalSupply() on each — never breaks if Aave upgrades
+// Step 1: resolve variableDebt token address dynamically from Data Provider
+// Step 2: call totalSupply() on that address
+// USDC + WETH only — WBTC Aave liquidity too low, often returns empty
+// 400ms delay between calls to avoid Etherscan 3/sec rate limit
 
-// Aave V3 Pool on Ethereum mainnet
-const AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
-
-// Aave V3 Pool Data Provider on Ethereum mainnet
 const AAVE_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3";
 
-// getReserveTokensAddresses(address asset) selector
 const GET_RESERVE_TOKENS_SIG = "0xd2493b6c";
+const TOTAL_SUPPLY_SIG       = "0x18160ddd";
 
-// totalSupply() selector
-const TOTAL_SUPPLY_SIG = "0x18160ddd";
-
-const ASSETS = [
-  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-  "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
+// USDC and WETH only — most reliable, dominate borrow volume
+const BORROW_ASSETS = [
+  { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", symbol: "USDC" },
+  { address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH" },
 ];
-
-async function ethCall(to, data) {
-  const url =
-    `https://api.etherscan.io/v2/api?chainid=1` +
-    `&module=proxy&action=eth_call` +
-    `&to=${to}` +
-    `&data=${data}` +
-    `&tag=latest` +
-    `&apikey=${ETHERSCAN_API_KEY}`;
-
-  const res  = await fetch(url);
-  const json = await res.json();
-
-  if (!json.result || json.result === "0x" || json.result.length < 10) {
-    throw new Error(`empty response from ${to}`);
-  }
-
-  return json.result;
-}
 
 async function fetchBorrows() {
   try {
     let totalBorrows = 0n;
     let successCount = 0;
 
-    for (const asset of ASSETS) {
+    for (const asset of BORROW_ASSETS) {
       try {
-        // Step 1 — dynamically resolve variableDebt token address
-        const paddedAsset = asset.slice(2).toLowerCase().padStart(64, "0");
-        const reserveCallData = GET_RESERVE_TOKENS_SIG + paddedAsset;
+        // Delay between each asset to avoid rate limiting
+        if (successCount > 0) await sleep(400);
 
-        const reserveResult = await ethCall(AAVE_DATA_PROVIDER, reserveCallData);
+        // Step 1 — resolve live variableDebt token address
+        const paddedAsset    = asset.address.slice(2).toLowerCase().padStart(64, "0");
+        const reserveResult  = await ethCall(AAVE_DATA_PROVIDER, GET_RESERVE_TOKENS_SIG + paddedAsset);
 
-        // getReserveTokensAddresses returns 3 values:
+        // getReserveTokensAddresses returns:
         // [0] aTokenAddress
         // [1] stableDebtTokenAddress
-        // [2] variableDebtTokenAddress  <── we want this
+        // [2] variableDebtTokenAddress  ← slot 2
         const hex = reserveResult.slice(2);
-        const variableDebtAddress =
-          "0x" + hex.slice(2 * 64, 3 * 64).slice(24); // last 20 bytes of slot 2
+        const variableDebtAddress = "0x" + hex.slice(2 * 64, 3 * 64).slice(24);
 
         if (
           !variableDebtAddress ||
           variableDebtAddress === "0x0000000000000000000000000000000000000000"
         ) {
-          console.warn(`  BORROWS: could not resolve variableDebt for ${asset}`);
+          console.warn(`  BORROWS: could not resolve variableDebt for ${asset.symbol}`);
           continue;
         }
 
-        // Step 2 — call totalSupply() on the live variableDebt token
-        const totalSupplyResult = await ethCall(variableDebtAddress, TOTAL_SUPPLY_SIG);
-
-        const supply = BigInt(totalSupplyResult);
+        // Step 2 — totalSupply() on live variableDebt token
+        await sleep(400); // extra delay before second call
+        const supplyResult = await ethCall(variableDebtAddress, TOTAL_SUPPLY_SIG);
+        const supply       = BigInt(supplyResult);
 
         if (supply === 0n) {
-          console.warn(`  BORROWS: zero totalSupply for ${asset}, skipping`);
+          console.warn(`  BORROWS: zero supply for ${asset.symbol}, skipping`);
           continue;
         }
 
-        console.log(`  BORROWS: asset ${asset} → variableDebt ${variableDebtAddress} → supply ${supply}`);
+        console.log(`  BORROWS: ${asset.symbol} → variableDebt ${variableDebtAddress} → supply ${supply}`);
 
         totalBorrows += supply;
         successCount++;
 
       } catch (innerErr) {
-        console.warn(`  BORROWS: asset ${asset} error — ${innerErr.message}`);
+        console.warn(`  BORROWS: ${asset.symbol} error — ${innerErr.message}`);
       }
     }
 
@@ -191,9 +208,12 @@ async function fetchBorrows() {
       throw new Error("all asset calls failed or returned zero");
     }
 
-    // Scale to ~1e18 tradable range
-    const scaled  = totalBorrows / BigInt("100000000000000000000");
-    const floored = scaled > 0n ? scaled : PRICE_PRECISION;
+    // USDC is 6 decimals, WETH is 18 decimals
+    // WETH supply dominates — normalize by 1e15 to get a clean ~1e18 range
+    const scaled  = totalBorrows / BigInt("1000000000000000");
+    const floored = scaled > PRICE_PRECISION
+      ? scaled
+      : PRICE_PRECISION;
 
     pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
 
@@ -249,11 +269,12 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const [gas, borrows, txsPerBlock] = await Promise.all([
-      fetchGas(),
-      fetchBorrows(),
-      fetchTxsPerBlock()
-    ]);
+    // Sequential fetches to avoid rate limiting — not Promise.all
+    const gas        = await fetchGas();
+    await sleep(400);
+    const borrows    = await fetchBorrows();
+    await sleep(400);
+    const txsPerBlock = await fetchTxsPerBlock();
 
     console.log("  Pushing to chain...");
 
