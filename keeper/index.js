@@ -47,20 +47,20 @@ const contract =
 
 let latestPrices = {
   GAS: 0,
-  AAVE_BORROWS: 0,
+  ACTIVE_ADDRESSES: 0,
   TXS_PER_BLOCK: 0,
   updatedAt: 0,
 };
 
 // ─── ROLLING AVERAGE WINDOWS ─────────────────────────────────────────────────
 
-const GAS_WINDOW     = 20;
-const BORROWS_WINDOW = 20;
-const TXS_WINDOW     = 20;
+const GAS_WINDOW      = 20;
+const ACTIVE_WINDOW   = 20;
+const TXS_WINDOW      = 20;
 
-const gasHistory     = [];
-const borrowsHistory = [];
-const txsHistory     = [];
+const gasHistory      = [];
+const activeHistory   = [];
+const txsHistory      = [];
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -77,37 +77,6 @@ function rollingAverage(arr) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ─── ETHERSCAN CALL HELPER ────────────────────────────────────────────────────
-
-async function ethCall(to, data) {
-  const url =
-    `https://api.etherscan.io/v2/api?chainid=1` +
-    `&module=proxy&action=eth_call` +
-    `&to=${to}` +
-    `&data=${data}` +
-    `&tag=latest` +
-    `&apikey=${ETHERSCAN_API_KEY}`;
-
-  const res  = await fetch(url);
-  const json = await res.json();
-
-  if (
-    !json.result ||
-    json.result === "0x" ||
-    json.result.length < 10 ||
-    typeof json.result !== "string" ||
-    !json.result.startsWith("0x")
-  ) {
-    throw new Error(
-      `bad response: ${typeof json.result === "string"
-        ? json.result.slice(0, 60)
-        : JSON.stringify(json.result)}`
-    );
-  }
-
-  return json.result;
 }
 
 // ─── SLOT 0 — GAS ────────────────────────────────────────────────────────────
@@ -147,80 +116,43 @@ async function fetchGas() {
   }
 }
 
-// ─── SLOT 1 — AAVE BORROWS ───────────────────────────────────────────────────
+// ─── SLOT 1 — ACTIVE ADDRESSES ───────────────────────────────────────────────
 
-const AAVE_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3";
-
-const GET_RESERVE_TOKENS_SIG = "0xd2493b6c";
-const TOTAL_SUPPLY_SIG       = "0x18160ddd";
-
-const BORROW_ASSETS = [
-  { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", symbol: "USDC" },
-  { address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH" },
-];
-
-async function fetchBorrows() {
+async function fetchActiveAddresses() {
   try {
-    let totalBorrows = 0n;
-    let successCount = 0;
+    // Fetch latest block with full tx list
+    const url =
+      `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
 
-    for (const asset of BORROW_ASSETS) {
-      try {
-        if (successCount > 0) await sleep(400);
+    const res  = await fetch(url);
+    const data = await res.json();
 
-        const paddedAsset    = asset.address.slice(2).toLowerCase().padStart(64, "0");
-        const reserveResult  = await ethCall(AAVE_DATA_PROVIDER, GET_RESERVE_TOKENS_SIG + paddedAsset);
+    const txs = data?.result?.transactions ?? [];
 
-        const hex = reserveResult.slice(2);
-        const variableDebtAddress = "0x" + hex.slice(2 * 64, 3 * 64).slice(24);
+    if (txs.length === 0) throw new Error("empty block or bad response");
 
-        if (
-          !variableDebtAddress ||
-          variableDebtAddress === "0x0000000000000000000000000000000000000000"
-        ) {
-          console.warn(`  BORROWS: could not resolve variableDebt for ${asset.symbol}`);
-          continue;
-        }
-
-        await sleep(400);
-        const supplyResult = await ethCall(variableDebtAddress, TOTAL_SUPPLY_SIG);
-        const supply       = BigInt(supplyResult);
-
-        if (supply === 0n) {
-          console.warn(`  BORROWS: zero supply for ${asset.symbol}, skipping`);
-          continue;
-        }
-
-        console.log(`  BORROWS: ${asset.symbol} → variableDebt ${variableDebtAddress} → supply ${supply}`);
-
-        totalBorrows += supply;
-        successCount++;
-
-      } catch (innerErr) {
-        console.warn(`  BORROWS: ${asset.symbol} error — ${innerErr.message}`);
-      }
+    // Count unique addresses (from + to) in this block
+    const addressSet = new Set();
+    for (const tx of txs) {
+      if (tx.from) addressSet.add(tx.from.toLowerCase());
+      if (tx.to)   addressSet.add(tx.to.toLowerCase());
     }
 
-    if (successCount === 0 || totalBorrows === 0n) {
-      throw new Error("all asset calls failed or returned zero");
-    }
+    const count  = addressSet.size;
+    const scaled = BigInt(count) * PRICE_PRECISION;
 
-    const scaled  = (totalBorrows * PRICE_PRECISION) / BigInt("1000000000000000000000000");
-    const floored = scaled > 0n ? scaled : PRICE_PRECISION;
+    pushToWindow(activeHistory, scaled, ACTIVE_WINDOW);
 
-    pushToWindow(borrowsHistory, floored, BORROWS_WINDOW);
+    const smoothed = rollingAverage(activeHistory);
 
-    const smoothed = rollingAverage(borrowsHistory);
-
-    console.log(`  AAVE BORROWS total: ${totalBorrows} | scaled: ${floored} | smoothed: ${smoothed}`);
+    console.log(`  ACTIVE ADDRESSES: ${count} unique | smoothed: ${smoothed}`);
 
     return smoothed;
-
   } catch (err) {
-    console.error(`  AAVE BORROWS fetch error: ${err.message}`);
-    return borrowsHistory.length > 0
-      ? rollingAverage(borrowsHistory)
-      : PRICE_PRECISION;
+    console.error(`  ACTIVE ADDRESSES fetch error: ${err.message}`);
+    return activeHistory.length > 0
+      ? rollingAverage(activeHistory)
+      : BigInt("500000000000000000000"); // fallback ~500 addresses
   }
 }
 
@@ -262,17 +194,17 @@ async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching prices...`);
 
-    const gas         = await fetchGas();
+    const gas            = await fetchGas();
     await sleep(400);
-    const borrows     = await fetchBorrows();
+    const activeAddresses = await fetchActiveAddresses();
     await sleep(400);
-    const txsPerBlock = await fetchTxsPerBlock();
+    const txsPerBlock    = await fetchTxsPerBlock();
 
     console.log("  Pushing to chain...");
 
     const tx = await contract.pushPrices([
       gas,
-      borrows,
+      activeAddresses,
       txsPerBlock
     ]);
 
@@ -284,13 +216,13 @@ async function pushPrices() {
 
     // ── Update price cache after confirmed push ──
     latestPrices = {
-      GAS:          Number(gas)         / 1e18,
-      AAVE_BORROWS: Number(borrows)     / 1e18,
-      TXS_PER_BLOCK: Number(txsPerBlock) / 1e18,
-      updatedAt:    Date.now(),
+      GAS:              Number(gas)            / 1e18,
+      ACTIVE_ADDRESSES: Number(activeAddresses) / 1e18,
+      TXS_PER_BLOCK:    Number(txsPerBlock)    / 1e18,
+      updatedAt:        Date.now(),
     };
 
-    console.log(`  📡 Cache updated: GAS=${latestPrices.GAS} | BORROWS=${latestPrices.AAVE_BORROWS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
+    console.log(`  📡 Cache updated: GAS=${latestPrices.GAS} | ACTIVE=${latestPrices.ACTIVE_ADDRESSES} | TXS=${latestPrices.TXS_PER_BLOCK}`);
 
   } catch (err) {
     console.error(`  ❌ Error: ${err.message}`);
