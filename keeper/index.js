@@ -34,7 +34,7 @@ const wallet = new ethers.Wallet(KEEPER_PRIVATE_KEY, provider);
 const perpsContract = new ethers.Contract(PROXY_ADDRESS, PERPS_ABI, wallet);
 const predictContract = new ethers.Contract(PREDICT_PROXY_ADDRESS, PREDICT_ABI, wallet);
 
-// ─── ENUMS (match Solidity exactly) ──────────────────────────────────────────
+// ─── ENUMS ───────────────────────────────────────────────────────────────────
 
 const Metric = {
   ACTIVE_ADDRESSES: 0,
@@ -57,6 +57,35 @@ const RoundStatus = {
   RESOLVED: 1,
   REFUNDED: 2
 };
+
+// ─── TRANSACTION QUEUE ───────────────────────────────────────────────────────
+// All on-chain writes go through this queue — one at a time, no nonce conflicts
+
+const txQueue = [];
+let txBusy = false;
+
+async function enqueue(fn) {
+  return new Promise((resolve, reject) => {
+    txQueue.push({ fn, resolve, reject });
+    if (!txBusy) processQueue();
+  });
+}
+
+async function processQueue() {
+  if (txQueue.length === 0) {
+    txBusy = false;
+    return;
+  }
+  txBusy = true;
+  const { fn, resolve, reject } = txQueue.shift();
+  try {
+    const result = await fn();
+    resolve(result);
+  } catch (err) {
+    reject(err);
+  }
+  processQueue();
+}
 
 // ─── PRICE CACHE ─────────────────────────────────────────────────────────────
 
@@ -106,6 +135,20 @@ function sleep(ms) {
 
 function toScaled(value) {
   return BigInt(Math.round(value)) * PRICE_PRECISION;
+}
+
+function getCurrentMetricValue(metric) {
+  switch (metric) {
+    case Metric.ACTIVE_ADDRESSES:        return toScaled(networkFeed.ACTIVE_ADDRESSES) || 1n;
+    case Metric.WHALE_TRANSFERS:         return toScaled(networkFeed.WHALE_TRANSFERS) || 1n;
+    case Metric.ETH_INTO_AAVE:           return toScaled(networkFeed.ETH_INTO_AAVE) || 1n;
+    case Metric.LIQUIDATION_VOLUME:      return toScaled(networkFeed.LIQUIDATION_VOLUME) || 1n;
+    case Metric.STABLES_MINTED_BURNED:   return toScaled(networkFeed.STABLES_MINTED_BURNED) || 1n;
+    case Metric.NEW_WALLET_CREATION:     return toScaled(networkFeed.NEW_WALLET_CREATION) || 1n;
+    case Metric.BRIDGE_INFLOWS_OUTFLOWS: return toScaled(networkFeed.BRIDGE_INFLOWS_OUTFLOWS) || 1n;
+    case Metric.DEX_VOLUME:              return toScaled(networkFeed.DEX_VOLUME) || 1n;
+    default: return 1n;
+  }
 }
 
 // ─── SLOT 0 — GAS ────────────────────────────────────────────────────────────
@@ -320,11 +363,9 @@ async function updateNetworkFeed() {
     feedTick++;
     console.log(`[${new Date().toISOString()}] Network Feed tick ${feedTick}`);
 
-    // Every tick (15s)
     networkFeed.ACTIVE_ADDRESSES = await fetchActiveAddresses();
     await sleep(300);
 
-    // Every 4 ticks (~1min)
     if (feedTick % 4 === 0) {
       networkFeed.WHALE_TRANSFERS = await fetchWhaleTransfers();
       await sleep(300);
@@ -338,7 +379,6 @@ async function updateNetworkFeed() {
       await sleep(300);
     }
 
-    // Every 20 ticks (~5min)
     if (feedTick % 20 === 0) {
       networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows();
       await sleep(300);
@@ -353,27 +393,47 @@ async function updateNetworkFeed() {
   }
 }
 
-// ─── PREDICTION MARKET MANAGER ────────────────────────────────────────────────
+// ─── PERPS PRICE PUSH ────────────────────────────────────────────────────────
+
+async function pushPrices() {
+  try {
+    console.log(`[${new Date().toISOString()}] Fetching perps prices...`);
+
+    const gas = await fetchGas();
+    await sleep(400);
+    const txs = await fetchTxsPerBlock();
+
+    await enqueue(async () => {
+      console.log(`  Pushing to chain...`);
+      const tx = await perpsContract.pushPrices([
+        gas,
+        1n,
+        txs
+      ]);
+      console.log(`  TX sent: ${tx.hash}`);
+      await tx.wait();
+      console.log("  ✅ Perps confirmed.");
+
+      latestPrices = {
+        GAS: Number(gas) / 1e18,
+        TXS_PER_BLOCK: Number(txs) / 1e18,
+        updatedAt: Date.now()
+      };
+
+      console.log(`  📡 GAS=${latestPrices.GAS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
+    });
+
+  } catch (err) {
+    console.error(`  ❌ Perps push error: ${err.message}`);
+  }
+}
+
+// ─── PREDICTION ROUND MANAGER ─────────────────────────────────────────────────
 
 const roundTracker = {};
 
 function getRoundKey(metric, timeframe) {
   return `${metric}_${timeframe}`;
-}
-
-// Always returns at least 1n so rounds are never skipped due to zero values
-function getCurrentMetricValue(metric) {
-  switch (metric) {
-    case Metric.ACTIVE_ADDRESSES:        return toScaled(networkFeed.ACTIVE_ADDRESSES) || 1n;
-    case Metric.WHALE_TRANSFERS:         return toScaled(networkFeed.WHALE_TRANSFERS) || 1n;
-    case Metric.ETH_INTO_AAVE:           return toScaled(networkFeed.ETH_INTO_AAVE) || 1n;
-    case Metric.LIQUIDATION_VOLUME:      return toScaled(networkFeed.LIQUIDATION_VOLUME) || 1n;
-    case Metric.STABLES_MINTED_BURNED:   return toScaled(networkFeed.STABLES_MINTED_BURNED) || 1n;
-    case Metric.NEW_WALLET_CREATION:     return toScaled(networkFeed.NEW_WALLET_CREATION) || 1n;
-    case Metric.BRIDGE_INFLOWS_OUTFLOWS: return toScaled(networkFeed.BRIDGE_INFLOWS_OUTFLOWS) || 1n;
-    case Metric.DEX_VOLUME:              return toScaled(networkFeed.DEX_VOLUME) || 1n;
-    default: return 1n;
-  }
 }
 
 async function managePredictionRounds() {
@@ -393,46 +453,47 @@ async function managePredictionRounds() {
           if (latestId === 0n) {
             // Never opened — open first round
             const startValue = getCurrentMetricValue(metricId);
-            const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-            await tx.wait();
-            const newId = await predictContract.getLatestRound(metricId, timeframeId);
-            const round = await predictContract.rounds(newId);
-            roundTracker[key] = { roundId: newId, closeTime: Number(round.closeTime) };
-            console.log(`  ✅ Opened first round: ${metricName} ${timeframeName} ID=${newId}`);
+            await enqueue(async () => {
+              const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+              await tx.wait();
+              const newId = await predictContract.getLatestRound(metricId, timeframeId);
+              const round = await predictContract.rounds(newId);
+              roundTracker[key] = { roundId: newId, closeTime: Number(round.closeTime) };
+              console.log(`  ✅ Opened first round: ${metricName} ${timeframeName} ID=${newId}`);
+            });
           } else {
-            // Round exists — load it
             const round = await predictContract.rounds(latestId);
             await sleep(200);
             if (Number(round.status) === RoundStatus.OPEN) {
               roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
               console.log(`  📋 Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
             } else {
-              // Latest resolved/refunded — open new
               const startValue = getCurrentMetricValue(metricId);
-              const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-              await tx.wait();
-              const newId = await predictContract.getLatestRound(metricId, timeframeId);
-              const newRound = await predictContract.rounds(newId);
-              roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-              console.log(`  ✅ Opened new round: ${metricName} ${timeframeName} ID=${newId}`);
+              await enqueue(async () => {
+                const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                await tx.wait();
+                const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                const newRound = await predictContract.rounds(newId);
+                roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
+                console.log(`  ✅ Opened new round: ${metricName} ${timeframeName} ID=${newId}`);
+              });
             }
           }
         } else {
-          // Round tracked — check if needs resolving
           if (now >= tracked.closeTime) {
             const endValue = getCurrentMetricValue(metricId);
-            const tx = await predictContract.resolveRound(tracked.roundId, endValue);
-            await tx.wait();
-            console.log(`  ✅ Resolved round: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
-
-            // Open next round immediately
             const startValue = getCurrentMetricValue(metricId);
-            const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
-            await tx2.wait();
-            const newId = await predictContract.getLatestRound(metricId, timeframeId);
-            const newRound = await predictContract.rounds(newId);
-            roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-            console.log(`  ✅ Opened next round: ${metricName} ${timeframeName} ID=${newId}`);
+            await enqueue(async () => {
+              const tx = await predictContract.resolveRound(tracked.roundId, endValue);
+              await tx.wait();
+              console.log(`  ✅ Resolved round: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
+              const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
+              await tx2.wait();
+              const newId = await predictContract.getLatestRound(metricId, timeframeId);
+              const newRound = await predictContract.rounds(newId);
+              roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
+              console.log(`  ✅ Opened next round: ${metricName} ${timeframeName} ID=${newId}`);
+            });
           }
         }
 
@@ -441,39 +502,6 @@ async function managePredictionRounds() {
     }
   } catch (err) {
     console.error(`  Prediction round error: ${err.message}`);
-  }
-}
-
-// ─── PERPS PRICE PUSH LOOP ────────────────────────────────────────────────────
-
-async function pushPrices() {
-  try {
-    console.log(`[${new Date().toISOString()}] Pushing perps prices...`);
-
-    const gas = await fetchGas();
-    await sleep(400);
-    const txs = await fetchTxsPerBlock();
-
-    const tx = await perpsContract.pushPrices([
-      gas,
-      1n, // Slot 1 retired — dummy value, must be > 0
-      txs
-    ]);
-
-    console.log(`  TX sent: ${tx.hash}`);
-    await tx.wait();
-    console.log("  ✅ Confirmed.");
-
-    latestPrices = {
-      GAS: Number(gas) / 1e18,
-      TXS_PER_BLOCK: Number(txs) / 1e18,
-      updatedAt: Date.now()
-    };
-
-    console.log(`  📡 GAS=${latestPrices.GAS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
-
-  } catch (err) {
-    console.error(`  ❌ Perps push error: ${err.message}`);
   }
 }
 
@@ -501,13 +529,12 @@ http.createServer((req, res) => {
 
 console.log("⚡ ChainFlux Keeper V3 starting...");
 
-// Start perps and feed immediately
 pushPrices();
 updateNetworkFeed();
 setInterval(pushPrices, INTERVAL_MS);
 setInterval(updateNetworkFeed, INTERVAL_MS);
 
-// Delay prediction rounds by 2 minutes to let feed populate first
+// Delay prediction rounds 2 minutes to let feed populate first
 setTimeout(() => {
   console.log("⏰ Starting prediction round manager...");
   managePredictionRounds();
