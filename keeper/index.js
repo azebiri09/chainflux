@@ -34,7 +34,7 @@ const wallet = new ethers.Wallet(KEEPER_PRIVATE_KEY, provider);
 const perpsContract = new ethers.Contract(PROXY_ADDRESS, PERPS_ABI, wallet);
 const predictContract = new ethers.Contract(PREDICT_PROXY_ADDRESS, PREDICT_ABI, wallet);
 
-// ─── METRICS ENUM (matches Solidity) ─────────────────────────────────────────
+// ─── ENUMS (match Solidity exactly) ──────────────────────────────────────────
 
 const Metric = {
   ACTIVE_ADDRESSES: 0,
@@ -320,9 +320,11 @@ async function updateNetworkFeed() {
     feedTick++;
     console.log(`[${new Date().toISOString()}] Network Feed tick ${feedTick}`);
 
+    // Every tick (15s)
     networkFeed.ACTIVE_ADDRESSES = await fetchActiveAddresses();
     await sleep(300);
 
+    // Every 4 ticks (~1min)
     if (feedTick % 4 === 0) {
       networkFeed.WHALE_TRANSFERS = await fetchWhaleTransfers();
       await sleep(300);
@@ -336,6 +338,7 @@ async function updateNetworkFeed() {
       await sleep(300);
     }
 
+    // Every 20 ticks (~5min)
     if (feedTick % 20 === 0) {
       networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows();
       await sleep(300);
@@ -358,17 +361,18 @@ function getRoundKey(metric, timeframe) {
   return `${metric}_${timeframe}`;
 }
 
+// Always returns at least 1n so rounds are never skipped due to zero values
 function getCurrentMetricValue(metric) {
   switch (metric) {
-    case Metric.ACTIVE_ADDRESSES:        return toScaled(networkFeed.ACTIVE_ADDRESSES);
-    case Metric.WHALE_TRANSFERS:         return toScaled(networkFeed.WHALE_TRANSFERS);
-    case Metric.ETH_INTO_AAVE:           return toScaled(networkFeed.ETH_INTO_AAVE);
-    case Metric.LIQUIDATION_VOLUME:      return toScaled(networkFeed.LIQUIDATION_VOLUME);
-    case Metric.STABLES_MINTED_BURNED:   return toScaled(networkFeed.STABLES_MINTED_BURNED);
-    case Metric.NEW_WALLET_CREATION:     return toScaled(networkFeed.NEW_WALLET_CREATION);
-    case Metric.BRIDGE_INFLOWS_OUTFLOWS: return toScaled(networkFeed.BRIDGE_INFLOWS_OUTFLOWS);
-    case Metric.DEX_VOLUME:              return toScaled(networkFeed.DEX_VOLUME);
-    default: return 0n;
+    case Metric.ACTIVE_ADDRESSES:        return toScaled(networkFeed.ACTIVE_ADDRESSES) || 1n;
+    case Metric.WHALE_TRANSFERS:         return toScaled(networkFeed.WHALE_TRANSFERS) || 1n;
+    case Metric.ETH_INTO_AAVE:           return toScaled(networkFeed.ETH_INTO_AAVE) || 1n;
+    case Metric.LIQUIDATION_VOLUME:      return toScaled(networkFeed.LIQUIDATION_VOLUME) || 1n;
+    case Metric.STABLES_MINTED_BURNED:   return toScaled(networkFeed.STABLES_MINTED_BURNED) || 1n;
+    case Metric.NEW_WALLET_CREATION:     return toScaled(networkFeed.NEW_WALLET_CREATION) || 1n;
+    case Metric.BRIDGE_INFLOWS_OUTFLOWS: return toScaled(networkFeed.BRIDGE_INFLOWS_OUTFLOWS) || 1n;
+    case Metric.DEX_VOLUME:              return toScaled(networkFeed.DEX_VOLUME) || 1n;
+    default: return 1n;
   }
 }
 
@@ -387,8 +391,8 @@ async function managePredictionRounds() {
           await sleep(200);
 
           if (latestId === 0n) {
+            // Never opened — open first round
             const startValue = getCurrentMetricValue(metricId);
-            if (startValue === 0n) continue;
             const tx = await predictContract.openRound(metricId, timeframeId, startValue);
             await tx.wait();
             const newId = await predictContract.getLatestRound(metricId, timeframeId);
@@ -396,14 +400,15 @@ async function managePredictionRounds() {
             roundTracker[key] = { roundId: newId, closeTime: Number(round.closeTime) };
             console.log(`  ✅ Opened first round: ${metricName} ${timeframeName} ID=${newId}`);
           } else {
+            // Round exists — load it
             const round = await predictContract.rounds(latestId);
             await sleep(200);
             if (Number(round.status) === RoundStatus.OPEN) {
               roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
               console.log(`  📋 Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
             } else {
+              // Latest resolved/refunded — open new
               const startValue = getCurrentMetricValue(metricId);
-              if (startValue === 0n) continue;
               const tx = await predictContract.openRound(metricId, timeframeId, startValue);
               await tx.wait();
               const newId = await predictContract.getLatestRound(metricId, timeframeId);
@@ -413,17 +418,15 @@ async function managePredictionRounds() {
             }
           }
         } else {
+          // Round tracked — check if needs resolving
           if (now >= tracked.closeTime) {
             const endValue = getCurrentMetricValue(metricId);
             const tx = await predictContract.resolveRound(tracked.roundId, endValue);
             await tx.wait();
             console.log(`  ✅ Resolved round: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
 
+            // Open next round immediately
             const startValue = getCurrentMetricValue(metricId);
-            if (startValue === 0n) {
-              delete roundTracker[key];
-              continue;
-            }
             const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
             await tx2.wait();
             const newId = await predictContract.getLatestRound(metricId, timeframeId);
@@ -498,10 +501,15 @@ http.createServer((req, res) => {
 
 console.log("⚡ ChainFlux Keeper V3 starting...");
 
+// Start perps and feed immediately
 pushPrices();
 updateNetworkFeed();
-managePredictionRounds();
-
 setInterval(pushPrices, INTERVAL_MS);
 setInterval(updateNetworkFeed, INTERVAL_MS);
-setInterval(managePredictionRounds, 60000);
+
+// Delay prediction rounds by 2 minutes to let feed populate first
+setTimeout(() => {
+  console.log("⏰ Starting prediction round manager...");
+  managePredictionRounds();
+  setInterval(managePredictionRounds, 60000);
+}, 120000);
