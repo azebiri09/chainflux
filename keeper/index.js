@@ -161,7 +161,6 @@ async function fetchTxsPerBlock() {
 
 // ─── NETWORK FEED FETCHERS ────────────────────────────────────────────────────
 
-// 1. Active Addresses (15s)
 async function fetchActiveAddresses() {
   try {
     const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
@@ -182,14 +181,13 @@ async function fetchActiveAddresses() {
   }
 }
 
-// 2. Whale Transfers (1min) — ETH transfers > 100 ETH in latest block
 async function fetchWhaleTransfers() {
   try {
     const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
     const txs = data?.result?.transactions ?? [];
-    const WHALE_THRESHOLD = BigInt("100000000000000000000"); // 100 ETH in wei
+    const WHALE_THRESHOLD = BigInt("100000000000000000000");
     let whaleCount = 0;
     for (const tx of txs) {
       if (tx.value && BigInt(tx.value) >= WHALE_THRESHOLD) whaleCount++;
@@ -202,7 +200,6 @@ async function fetchWhaleTransfers() {
   }
 }
 
-// 3. ETH into Aave (1min) — ETH sent to Aave V3 pool
 async function fetchEthIntoAave() {
   try {
     const AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
@@ -222,7 +219,6 @@ async function fetchEthIntoAave() {
   }
 }
 
-// 4. Liquidation Volume (1min) — Aave V3 LiquidationCall events
 async function fetchLiquidationVolume() {
   try {
     const AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
@@ -240,7 +236,6 @@ async function fetchLiquidationVolume() {
   }
 }
 
-// 5. Stables Minted/Burned (1min) — USDC Transfer events from/to zero address
 async function fetchStablesMintedBurned() {
   try {
     const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
@@ -262,7 +257,6 @@ async function fetchStablesMintedBurned() {
   }
 }
 
-// 6. New Wallet Creation (1min) — txs with empty input and no "to" (contract creation) approximated by new EOAs
 async function fetchNewWalletCreation() {
   try {
     const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
@@ -281,7 +275,6 @@ async function fetchNewWalletCreation() {
   }
 }
 
-// 7. Bridge Inflows/Outflows (5min) — Arbitrum bridge contract activity
 async function fetchBridgeInflows() {
   try {
     const ARBITRUM_BRIDGE = "0x8315177aB297bA92A06054cE80a67Ed4DBd7ed3a";
@@ -301,7 +294,6 @@ async function fetchBridgeInflows() {
   }
 }
 
-// 8. DEX Volume (5min) — Uniswap V3 Swap events
 async function fetchDexVolume() {
   try {
     const UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
@@ -328,11 +320,9 @@ async function updateNetworkFeed() {
     feedTick++;
     console.log(`[${new Date().toISOString()}] Network Feed tick ${feedTick}`);
 
-    // Every tick (15s)
     networkFeed.ACTIVE_ADDRESSES = await fetchActiveAddresses();
     await sleep(300);
 
-    // Every 4 ticks (~1min)
     if (feedTick % 4 === 0) {
       networkFeed.WHALE_TRANSFERS = await fetchWhaleTransfers();
       await sleep(300);
@@ -346,7 +336,6 @@ async function updateNetworkFeed() {
       await sleep(300);
     }
 
-    // Every 20 ticks (~5min)
     if (feedTick % 20 === 0) {
       networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows();
       await sleep(300);
@@ -363,8 +352,6 @@ async function updateNetworkFeed() {
 
 // ─── PREDICTION MARKET MANAGER ────────────────────────────────────────────────
 
-// Tracks open round IDs per metric+timeframe
-// roundTracker[metric][timeframe] = { roundId, closeTime }
 const roundTracker = {};
 
 function getRoundKey(metric, timeframe) {
@@ -373,14 +360,14 @@ function getRoundKey(metric, timeframe) {
 
 function getCurrentMetricValue(metric) {
   switch (metric) {
-    case Metric.ACTIVE_ADDRESSES:     return toScaled(networkFeed.ACTIVE_ADDRESSES);
-    case Metric.WHALE_TRANSFERS:      return toScaled(networkFeed.WHALE_TRANSFERS);
-    case Metric.ETH_INTO_AAVE:        return toScaled(networkFeed.ETH_INTO_AAVE);
-    case Metric.LIQUIDATION_VOLUME:   return toScaled(networkFeed.LIQUIDATION_VOLUME);
-    case Metric.STABLES_MINTED_BURNED:return toScaled(networkFeed.STABLES_MINTED_BURNED);
-    case Metric.NEW_WALLET_CREATION:  return toScaled(networkFeed.NEW_WALLET_CREATION);
+    case Metric.ACTIVE_ADDRESSES:        return toScaled(networkFeed.ACTIVE_ADDRESSES);
+    case Metric.WHALE_TRANSFERS:         return toScaled(networkFeed.WHALE_TRANSFERS);
+    case Metric.ETH_INTO_AAVE:           return toScaled(networkFeed.ETH_INTO_AAVE);
+    case Metric.LIQUIDATION_VOLUME:      return toScaled(networkFeed.LIQUIDATION_VOLUME);
+    case Metric.STABLES_MINTED_BURNED:   return toScaled(networkFeed.STABLES_MINTED_BURNED);
+    case Metric.NEW_WALLET_CREATION:     return toScaled(networkFeed.NEW_WALLET_CREATION);
     case Metric.BRIDGE_INFLOWS_OUTFLOWS: return toScaled(networkFeed.BRIDGE_INFLOWS_OUTFLOWS);
-    case Metric.DEX_VOLUME:           return toScaled(networkFeed.DEX_VOLUME);
+    case Metric.DEX_VOLUME:              return toScaled(networkFeed.DEX_VOLUME);
     default: return 0n;
   }
 }
@@ -396,14 +383,12 @@ async function managePredictionRounds() {
         const now = Math.floor(Date.now() / 1000);
 
         if (!tracked) {
-          // No round tracked — check on-chain for latest
           const latestId = await predictContract.getLatestRound(metricId, timeframeId);
           await sleep(200);
 
           if (latestId === 0n) {
-            // Never opened — open first round
             const startValue = getCurrentMetricValue(metricId);
-            if (startValue === 0n) continue; // no data yet
+            if (startValue === 0n) continue;
             const tx = await predictContract.openRound(metricId, timeframeId, startValue);
             await tx.wait();
             const newId = await predictContract.getLatestRound(metricId, timeframeId);
@@ -411,14 +396,12 @@ async function managePredictionRounds() {
             roundTracker[key] = { roundId: newId, closeTime: Number(round.closeTime) };
             console.log(`  ✅ Opened first round: ${metricName} ${timeframeName} ID=${newId}`);
           } else {
-            // Round exists — load it
             const round = await predictContract.rounds(latestId);
             await sleep(200);
             if (Number(round.status) === RoundStatus.OPEN) {
               roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
               console.log(`  📋 Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
             } else {
-              // Latest is resolved/refunded — open new round
               const startValue = getCurrentMetricValue(metricId);
               if (startValue === 0n) continue;
               const tx = await predictContract.openRound(metricId, timeframeId, startValue);
@@ -430,14 +413,12 @@ async function managePredictionRounds() {
             }
           }
         } else {
-          // Round is tracked — check if it needs resolving
           if (now >= tracked.closeTime) {
             const endValue = getCurrentMetricValue(metricId);
             const tx = await predictContract.resolveRound(tracked.roundId, endValue);
             await tx.wait();
             console.log(`  ✅ Resolved round: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
 
-            // Open next round immediately
             const startValue = getCurrentMetricValue(metricId);
             if (startValue === 0n) {
               delete roundTracker[key];
@@ -472,7 +453,7 @@ async function pushPrices() {
 
     const tx = await perpsContract.pushPrices([
       gas,
-      0n, // Slot 1 retired — always 0
+      1n, // Slot 1 retired — dummy value, must be > 0
       txs
     ]);
 
@@ -517,16 +498,10 @@ http.createServer((req, res) => {
 
 console.log("⚡ ChainFlux Keeper V3 starting...");
 
-// Initial runs
 pushPrices();
 updateNetworkFeed();
 managePredictionRounds();
 
-// Perps prices every 15s
 setInterval(pushPrices, INTERVAL_MS);
-
-// Network feed every 15s
 setInterval(updateNetworkFeed, INTERVAL_MS);
-
-// Prediction round management every 60s
 setInterval(managePredictionRounds, 60000);
