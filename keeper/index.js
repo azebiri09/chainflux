@@ -59,7 +59,6 @@ const RoundStatus = {
 };
 
 // ─── TRANSACTION QUEUE ───────────────────────────────────────────────────────
-// All on-chain writes go through this queue — one at a time, no nonce conflicts
 
 const txQueue = [];
 let txBusy = false;
@@ -446,55 +445,83 @@ async function managePredictionRounds() {
         const tracked = roundTracker[key];
         const now = Math.floor(Date.now() / 1000);
 
-        if (!tracked) {
-          const latestId = await predictContract.getLatestRound(metricId, timeframeId);
-          await sleep(200);
-
-          if (latestId === 0n) {
-            // Never opened — open first round
-            const startValue = getCurrentMetricValue(metricId);
-            await enqueue(async () => {
-              const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-              await tx.wait();
-              const newId = await predictContract.getLatestRound(metricId, timeframeId);
-              const round = await predictContract.rounds(newId);
-              roundTracker[key] = { roundId: newId, closeTime: Number(round.closeTime) };
-              console.log(`  ✅ Opened first round: ${metricName} ${timeframeName} ID=${newId}`);
-            });
-          } else {
-            const round = await predictContract.rounds(latestId);
+        try {
+          if (!tracked) {
+            let latestId;
+            try {
+              latestId = await predictContract.getLatestRound(metricId, timeframeId);
+            } catch (e) {
+              console.error(`  getLatestRound failed ${metricName} ${timeframeName}: ${e.message}`);
+              await sleep(200);
+              continue;
+            }
             await sleep(200);
-            if (Number(round.status) === RoundStatus.OPEN) {
-              roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
-              console.log(`  📋 Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
+
+            let shouldOpen = false;
+
+            if (latestId === 0n) {
+              shouldOpen = true;
             } else {
+              try {
+                const round = await predictContract.rounds(latestId);
+                await sleep(200);
+                if (Number(round.status) === RoundStatus.OPEN) {
+                  roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
+                  console.log(`  📋 Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
+                } else {
+                  shouldOpen = true;
+                }
+              } catch (e) {
+                console.error(`  rounds() failed ${metricName} ${timeframeName}: ${e.message}`);
+                await sleep(200);
+                continue;
+              }
+            }
+
+            if (shouldOpen) {
+              const startValue = getCurrentMetricValue(metricId);
+              console.log(`  Opening round: ${metricName} ${timeframeName} startValue=${startValue}`);
+              await enqueue(async () => {
+                try {
+                  const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                  console.log(`  TX sent openRound ${metricName} ${timeframeName}: ${tx.hash}`);
+                  await tx.wait();
+                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                  const newRound = await predictContract.rounds(newId);
+                  roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
+                  console.log(`  ✅ Opened round: ${metricName} ${timeframeName} ID=${newId} closes=${newRound.closeTime}`);
+                } catch (e) {
+                  console.error(`  ❌ openRound FAILED ${metricName} ${timeframeName}: ${e.message}`);
+                }
+              });
+            }
+
+          } else {
+            if (now >= tracked.closeTime) {
+              const endValue = getCurrentMetricValue(metricId);
               const startValue = getCurrentMetricValue(metricId);
               await enqueue(async () => {
-                const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                await tx.wait();
-                const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                const newRound = await predictContract.rounds(newId);
-                roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-                console.log(`  ✅ Opened new round: ${metricName} ${timeframeName} ID=${newId}`);
+                try {
+                  const tx = await predictContract.resolveRound(tracked.roundId, endValue);
+                  console.log(`  TX sent resolveRound ${metricName} ${timeframeName}: ${tx.hash}`);
+                  await tx.wait();
+                  console.log(`  ✅ Resolved: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
+                  const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
+                  console.log(`  TX sent openRound next ${metricName} ${timeframeName}: ${tx2.hash}`);
+                  await tx2.wait();
+                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                  const newRound = await predictContract.rounds(newId);
+                  roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
+                  console.log(`  ✅ Opened next: ${metricName} ${timeframeName} ID=${newId}`);
+                } catch (e) {
+                  console.error(`  ❌ resolve/open FAILED ${metricName} ${timeframeName}: ${e.message}`);
+                }
               });
             }
           }
-        } else {
-          if (now >= tracked.closeTime) {
-            const endValue = getCurrentMetricValue(metricId);
-            const startValue = getCurrentMetricValue(metricId);
-            await enqueue(async () => {
-              const tx = await predictContract.resolveRound(tracked.roundId, endValue);
-              await tx.wait();
-              console.log(`  ✅ Resolved round: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
-              const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
-              await tx2.wait();
-              const newId = await predictContract.getLatestRound(metricId, timeframeId);
-              const newRound = await predictContract.rounds(newId);
-              roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-              console.log(`  ✅ Opened next round: ${metricName} ${timeframeName} ID=${newId}`);
-            });
-          }
+
+        } catch (e) {
+          console.error(`  Loop error ${metricName} ${timeframeName}: ${e.message}`);
         }
 
         await sleep(200);
@@ -521,6 +548,7 @@ http.createServer((req, res) => {
     res.end(JSON.stringify(latestPrices));
   }
 
+
 }).listen(process.env.PORT || 3000, () => {
   console.log(`📡 API listening on port ${process.env.PORT || 3000}`);
 });
@@ -534,7 +562,6 @@ updateNetworkFeed();
 setInterval(pushPrices, INTERVAL_MS);
 setInterval(updateNetworkFeed, INTERVAL_MS);
 
-// Delay prediction rounds 2 minutes to let feed populate first
 setTimeout(() => {
   console.log("⏰ Starting prediction round manager...");
   managePredictionRounds();
