@@ -38,13 +38,8 @@ const predictContract = new ethers.Contract(PREDICT_PROXY_ADDRESS, PREDICT_ABI, 
 
 const Metric = {
   ACTIVE_ADDRESSES: 0,
-  WHALE_TRANSFERS: 1,
   ETH_LARGE_TRANSFERS: 2,
-  LIQUIDATION_VOLUME: 3,
-  STABLES_MINTED_BURNED: 4,
-  NEW_WALLET_CREATION: 5,
-  BRIDGE_INFLOWS_OUTFLOWS: 6,
-  DEX_VOLUME: 7
+  LIQUIDATION_VOLUME: 3
 };
 
 const Timeframe = {
@@ -58,24 +53,13 @@ const RoundStatus = {
   REFUNDED: 2
 };
 
-// ─── MINIMUM THRESHOLDS ───────────────────────────────────────────────────────
+// ─── THRESHOLDS ───────────────────────────────────────────────────────────────
 
 const METRIC_THRESHOLDS = {
-  [Metric.ACTIVE_ADDRESSES]:        10,
-  [Metric.WHALE_TRANSFERS]:          2,
-  [Metric.ETH_LARGE_TRANSFERS]:      2,
-  [Metric.LIQUIDATION_VOLUME]:       1,
-  [Metric.STABLES_MINTED_BURNED]:  100,
-  [Metric.NEW_WALLET_CREATION]:      2,
-  [Metric.BRIDGE_INFLOWS_OUTFLOWS]: 0.05,
-  [Metric.DEX_VOLUME]:               2
+  [Metric.ACTIVE_ADDRESSES]: 10,
+  [Metric.ETH_LARGE_TRANSFERS]: 0.1,
+  [Metric.LIQUIDATION_VOLUME]: 50
 };
-
-function metricIsReady(metricId) {
-  const value = getRawMetricValue(metricId);
-  const threshold = METRIC_THRESHOLDS[metricId];
-  return value > threshold;
-}
 
 // ─── TRANSACTION QUEUE ────────────────────────────────────────────────────────
 
@@ -105,25 +89,19 @@ async function processQueue() {
   processQueue();
 }
 
-// ─── CACHES ───────────────────────────────────────────────────────────────────
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-let latestPrices = {
-  GAS: 0,
-  TXS_PER_BLOCK: 0,
-  updatedAt: 0
-};
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-let networkFeed = {
-  ACTIVE_ADDRESSES: 0,
-  WHALE_TRANSFERS: 0,
-  ETH_LARGE_TRANSFERS: 0,
-  LIQUIDATION_VOLUME: 0,
-  STABLES_MINTED_BURNED: 0,
-  NEW_WALLET_CREATION: 0,
-  BRIDGE_INFLOWS_OUTFLOWS: 0,
-  DEX_VOLUME: 0,
-  updatedAt: 0
-};
+function toScaled(value) {
+  return BigInt(Math.round(value * 1e4)) * (PRICE_PRECISION / BigInt(1e4));
+}
+
+function toHex(num) {
+  return "0x" + num.toString(16);
+}
 
 // ─── ROLLING AVERAGES ─────────────────────────────────────────────────────────
 
@@ -143,346 +121,172 @@ function rollingAverage(arr) {
   return sum / BigInt(arr.length);
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+// ─── DAILY HIGH / LOW ─────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+let dailyStats = {
+  GAS: { high: 0, low: Infinity },
+  TXS_PER_BLOCK: { high: 0, low: Infinity },
+  ACTIVE_ADDRESSES: { high: 0, low: Infinity }
+};
 
-function toScaled(value) {
-  return BigInt(Math.round(value)) * PRICE_PRECISION;
-}
+let lastDayReset = new Date().toISOString().slice(0, 10);
 
-function toHex(num) {
-  return "0x" + num.toString(16);
-}
-
-async function getBlockRange(numBlocks) {
-  const latest = await provider.getBlockNumber();
-  const from = Math.max(0, latest - numBlocks);
-  return { fromBlock: from, toBlock: latest, latestBlock: latest };
-}
-
-function getRawMetricValue(metric) {
-  switch (metric) {
-    case Metric.ACTIVE_ADDRESSES:        return networkFeed.ACTIVE_ADDRESSES || 0;
-    case Metric.WHALE_TRANSFERS:         return networkFeed.WHALE_TRANSFERS || 0;
-    case Metric.ETH_LARGE_TRANSFERS:     return networkFeed.ETH_LARGE_TRANSFERS || 0;
-    case Metric.LIQUIDATION_VOLUME:      return networkFeed.LIQUIDATION_VOLUME || 0;
-    case Metric.STABLES_MINTED_BURNED:   return networkFeed.STABLES_MINTED_BURNED || 0;
-    case Metric.NEW_WALLET_CREATION:     return networkFeed.NEW_WALLET_CREATION || 0;
-    case Metric.BRIDGE_INFLOWS_OUTFLOWS: return networkFeed.BRIDGE_INFLOWS_OUTFLOWS || 0;
-    case Metric.DEX_VOLUME:              return networkFeed.DEX_VOLUME || 0;
-    default: return 0;
+function checkDayReset() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== lastDayReset) {
+    dailyStats = {
+      GAS: { high: 0, low: Infinity },
+      TXS_PER_BLOCK: { high: 0, low: Infinity },
+      ACTIVE_ADDRESSES: { high: 0, low: Infinity }
+    };
+    lastDayReset = today;
+    console.log("Daily high/low reset for new UTC day.");
   }
 }
 
-function getCurrentMetricValue(metric) {
-  const raw = getRawMetricValue(metric);
-  return toScaled(raw) || 0n;
+function updateDailyStats(key, value) {
+  if (value <= 0) return;
+  if (value > dailyStats[key].high) dailyStats[key].high = value;
+  if (value < dailyStats[key].low) dailyStats[key].low = value;
 }
 
-// ─── SLOT 0 — GAS ─────────────────────────────────────────────────────────────
+// ─── CACHES ───────────────────────────────────────────────────────────────────
 
-async function fetchGas() {
+let latestPrices = {
+  GAS: 0,
+  TXS_PER_BLOCK: 0,
+  updatedAt: 0
+};
+
+let networkFeed = {
+  GAS: 0,
+  GAS_DAILY_HIGH: 0,
+  GAS_DAILY_LOW: 0,
+  TXS_PER_BLOCK: 0,
+  TXS_DAILY_HIGH: 0,
+  TXS_DAILY_LOW: 0,
+  ACTIVE_ADDRESSES: 0,
+  ACTIVE_DAILY_HIGH: 0,
+  ACTIVE_DAILY_LOW: 0,
+  updatedAt: 0
+};
+
+// ─── SINGLE BLOCK FETCH ───────────────────────────────────────────────────────
+// One call. All 3 metrics extracted from the same block.
+
+async function fetchBlockData() {
   try {
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_gasPrice&apikey=${ETHERSCAN_API_KEY}`;
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
-    if (!data.result || typeof data.result !== "string" || !data.result.startsWith("0x")) {
-      throw new Error("bad gas response");
-    }
-    const rawGwei = Number(BigInt(data.result)) / 1e9;
-    const scaled = BigInt(Math.round(rawGwei * 1e18));
-    pushToWindow(gasHistory, scaled, GAS_WINDOW);
-    const smoothed = rollingAverage(gasHistory);
-    console.log(`  GAS: ${rawGwei.toFixed(4)} gwei | smoothed: ${Number(smoothed) / 1e18}`);
-    return smoothed;
-  } catch (err) {
-    console.error(`  GAS error: ${err.message}`);
-    return gasHistory.length > 0 ? rollingAverage(gasHistory) : BigInt("220000000000000000");
-  }
-}
+    const block = data?.result;
 
-// ─── SLOT 2 — TXS PER BLOCK ───────────────────────────────────────────────────
+    if (!block) throw new Error("No block returned");
 
-async function fetchTxsPerBlock() {
-  try {
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=false&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const txs = data?.result?.transactions ?? [];
-    const count = txs.length;
-    if (count === 0) throw new Error("empty block");
-    const scaled = BigInt(count) * PRICE_PRECISION;
-    pushToWindow(txsHistory, scaled, TXS_WINDOW);
-    const smoothed = rollingAverage(txsHistory);
-    console.log(`  TXS PER BLOCK: ${count} | smoothed: ${Number(smoothed) / 1e18}`);
-    return smoothed;
-  } catch (err) {
-    console.error(`  TXS error: ${err.message}`);
-    return txsHistory.length > 0 ? rollingAverage(txsHistory) : BigInt("200000000000000000000");
-  }
-}
+    // GAS — baseFeePerGas in gwei
+    const baseFeeHex = block.baseFeePerGas || "0x0";
+    const rawGwei = Number(BigInt(baseFeeHex)) / 1e9;
+    const gasGwei = rawGwei > 0 ? rawGwei : (latestPrices.GAS > 0 ? latestPrices.GAS : 0.3);
 
-// ─── FEED FETCHERS ────────────────────────────────────────────────────────────
+    // TXS PER BLOCK — transaction count
+    const txs = block.transactions ?? [];
+    const txCount = txs.length > 0 ? txs.length : (latestPrices.TXS_PER_BLOCK > 0 ? latestPrices.TXS_PER_BLOCK : 200);
 
-async function fetchActiveAddresses() {
-  try {
-    const { latestBlock } = await getBlockRange(5);
+    // ACTIVE ADDRESSES — unique from/to in this block
     const addressSet = new Set();
-    for (let i = 0; i < 5; i++) {
-      const tag = toHex(latestBlock - i);
-      const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=${tag}&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      const txs = data?.result?.transactions ?? [];
-      for (const tx of txs) {
-        if (tx.from) addressSet.add(tx.from.toLowerCase());
-        if (tx.to) addressSet.add(tx.to.toLowerCase());
-      }
-      await sleep(1000);
+    for (const tx of txs) {
+      if (tx.from) addressSet.add(tx.from.toLowerCase());
+      if (tx.to) addressSet.add(tx.to.toLowerCase());
     }
-    const count = addressSet.size;
-    console.log(`  ACTIVE_ADDRESSES: ${count}`);
-    return count || networkFeed.ACTIVE_ADDRESSES || 0;
+    const activeCount = addressSet.size > 0 ? addressSet.size : (networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400);
+
+    console.log(`[${new Date().toISOString()}] Block fetch OK`);
+    console.log(`  GAS: ${gasGwei.toFixed(4)} gwei`);
+    console.log(`  TXS PER BLOCK: ${txCount}`);
+    console.log(`  ACTIVE ADDRESSES: ${activeCount}`);
+
+    return { gasGwei, txCount, activeCount };
+
   } catch (err) {
-    console.error(`  ACTIVE_ADDRESSES error: ${err.message}`);
-    return networkFeed.ACTIVE_ADDRESSES || 0;
+    console.error(`  Block fetch error: ${err.message}`);
+    return {
+      gasGwei: latestPrices.GAS > 0 ? latestPrices.GAS : 0.3,
+      txCount: latestPrices.TXS_PER_BLOCK > 0 ? latestPrices.TXS_PER_BLOCK : 200,
+      activeCount: networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400
+    };
   }
 }
 
-async function fetchWhaleTransfers() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(50);
-    const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
-    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${WETH}&topic0=${TRANSFER_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!Array.isArray(data?.result)) throw new Error("bad whale response");
-    const WHALE_THRESHOLD = BigInt("100000000000000000000");
-    let whaleCount = 0;
-    for (const log of data.result) {
-      try {
-        if (BigInt(log.data) >= WHALE_THRESHOLD) whaleCount++;
-      } catch {}
-    }
-    console.log(`  WHALE_TRANSFERS: ${whaleCount} over last 50 blocks`);
-    return whaleCount || networkFeed.WHALE_TRANSFERS || 0;
-  } catch (err) {
-    console.error(`  WHALE_TRANSFERS error: ${err.message}`);
-    return networkFeed.WHALE_TRANSFERS || 0;
-  }
-}
+// ─── UPDATE ALL METRICS ───────────────────────────────────────────────────────
 
-async function fetchEthLargeTransfers() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(200);
-    const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
-    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${WETH}&topic0=${TRANSFER_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!Array.isArray(data?.result)) throw new Error("bad eth large response");
-    const LARGE_THRESHOLD = BigInt("10000000000000000000");
-    let largeCount = 0;
-    for (const log of data.result) {
-      try {
-        if (BigInt(log.data) >= LARGE_THRESHOLD) largeCount++;
-      } catch {}
-    }
-    console.log(`  ETH_LARGE_TRANSFERS: ${largeCount} over last 200 blocks`);
-    return largeCount || networkFeed.ETH_LARGE_TRANSFERS || 0;
-  } catch (err) {
-    console.error(`  ETH_LARGE_TRANSFERS error: ${err.message}`);
-    return networkFeed.ETH_LARGE_TRANSFERS || 0;
-  }
-}
+async function updateAllMetrics() {
+  checkDayReset();
 
-async function fetchLiquidationVolume() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(500);
-    const AAVE_POOL = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2";
-    const LIQUIDATION_TOPIC = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${AAVE_POOL}&topic0=${LIQUIDATION_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!Array.isArray(data?.result)) throw new Error("bad liquidation response");
-    const count = data.result.length;
-    console.log(`  LIQUIDATION_VOLUME: ${count} events over last 500 blocks`);
-    return count || networkFeed.LIQUIDATION_VOLUME || 0;
-  } catch (err) {
-    console.error(`  LIQUIDATION_VOLUME error: ${err.message}`);
-    return networkFeed.LIQUIDATION_VOLUME || 0;
-  }
-}
+  const { gasGwei, txCount, activeCount } = await fetchBlockData();
 
-async function fetchStablesMintedBurned() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(200);
-    const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-    const ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    const urlMint = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${USDC}&topic0=${TRANSFER_TOPIC}&topic1=${ZERO}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    await sleep(1000);
-    const urlBurn = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${USDC}&topic0=${TRANSFER_TOPIC}&topic2=${ZERO}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    const resMint = await fetch(urlMint);
-    const dataMint = await resMint.json();
-    await sleep(1000);
-    const resBurn = await fetch(urlBurn);
-    const dataBurn = await resBurn.json();
-    if (!Array.isArray(dataMint?.result) && !Array.isArray(dataBurn?.result)) throw new Error("bad stables response");
-    let totalUsdc = 0;
-    for (const log of [...(Array.isArray(dataMint?.result) ? dataMint.result : []), ...(Array.isArray(dataBurn?.result) ? dataBurn.result : [])]) {
-      try {
-        totalUsdc += parseInt(log.data, 16) / 1e6;
-      } catch {}
-    }
-    const rounded = Math.round(totalUsdc);
-    console.log(`  STABLES_MINTED_BURNED: ${rounded} USDC over last 200 blocks`);
-    return rounded || networkFeed.STABLES_MINTED_BURNED || 0;
-  } catch (err) {
-    console.error(`  STABLES_MINTED_BURNED error: ${err.message}`);
-    return networkFeed.STABLES_MINTED_BURNED || 0;
-  }
-}
+  // Rolling averages for perps
+  const gasScaled = BigInt(Math.round(gasGwei * 1e18));
+  const txsScaled = BigInt(txCount) * PRICE_PRECISION;
+  pushToWindow(gasHistory, gasScaled, GAS_WINDOW);
+  pushToWindow(txsHistory, txsScaled, TXS_WINDOW);
+  const smoothedGas = rollingAverage(gasHistory);
+  const smoothedTxs = rollingAverage(txsHistory);
 
-async function fetchNewWalletCreation() {
-  try {
-    const { latestBlock } = await getBlockRange(20);
-    let newContracts = 0;
-    for (let i = 0; i < 20; i++) {
-      const tag = toHex(latestBlock - i);
-      const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=${tag}&boolean=true&apikey=${ETHERSCAN_API_KEY}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      const txs = data?.result?.transactions ?? [];
-      for (const tx of txs) {
-        if (!tx.to || tx.to === "" || tx.to === null) newContracts++;
-      }
-      await sleep(1000);
-    }
-    console.log(`  NEW_WALLET_CREATION: ${newContracts} deployments in last 20 blocks`);
-    return newContracts || networkFeed.NEW_WALLET_CREATION || 0;
-  } catch (err) {
-    console.error(`  NEW_WALLET_CREATION error: ${err.message}`);
-    return networkFeed.NEW_WALLET_CREATION || 0;
-  }
-}
+  // Update daily stats
+  updateDailyStats("GAS", gasGwei);
+  updateDailyStats("TXS_PER_BLOCK", txCount);
+  updateDailyStats("ACTIVE_ADDRESSES", activeCount);
 
-async function fetchBridgeInflows() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(500);
-    const ARBITRUM_BRIDGE = "0x8315177aB297bA92A06054cE80a67Ed4DBd7ed3a";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist&address=${ARBITRUM_BRIDGE}&startblock=${fromBlock}&endblock=${toBlock}&sort=desc&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!Array.isArray(data?.result)) throw new Error("bad bridge response");
-    let totalEth = 0;
-    for (const tx of data.result) {
-      try {
-        totalEth += Number(BigInt(tx.value || "0")) / 1e18;
-      } catch {}
-    }
-    const rounded = Math.round(totalEth * 100) / 100;
-    console.log(`  BRIDGE_INFLOWS_OUTFLOWS: ${rounded} ETH over last 500 blocks`);
-    return rounded || networkFeed.BRIDGE_INFLOWS_OUTFLOWS || 0;
-  } catch (err) {
-    console.error(`  BRIDGE_INFLOWS_OUTFLOWS error: ${err.message}`);
-    return networkFeed.BRIDGE_INFLOWS_OUTFLOWS || 0;
-  }
-}
+  // Update caches
+  latestPrices = {
+    GAS: Number(smoothedGas) / 1e18,
+    TXS_PER_BLOCK: Number(smoothedTxs) / 1e18,
+    updatedAt: Date.now()
+  };
 
-async function fetchDexVolume() {
-  try {
-    const { fromBlock, toBlock } = await getBlockRange(100);
-    const USDC_ETH_POOL = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640";
-    const SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${USDC_ETH_POOL}&topic0=${SWAP_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!Array.isArray(data?.result)) throw new Error("bad dex response");
-    const count = data.result.length;
-    console.log(`  DEX_VOLUME: ${count} swaps over last 100 blocks`);
-    return count || networkFeed.DEX_VOLUME || 0;
-  } catch (err) {
-    console.error(`  DEX_VOLUME error: ${err.message}`);
-    return networkFeed.DEX_VOLUME || 0;
-  }
-}
+  networkFeed = {
+    GAS: gasGwei,
+    GAS_DAILY_HIGH: dailyStats.GAS.high,
+    GAS_DAILY_LOW: dailyStats.GAS.low === Infinity ? 0 : dailyStats.GAS.low,
+    TXS_PER_BLOCK: txCount,
+    TXS_DAILY_HIGH: dailyStats.TXS_PER_BLOCK.high,
+    TXS_DAILY_LOW: dailyStats.TXS_PER_BLOCK.low === Infinity ? 0 : dailyStats.TXS_PER_BLOCK.low,
+    ACTIVE_ADDRESSES: activeCount,
+    ACTIVE_DAILY_HIGH: dailyStats.ACTIVE_ADDRESSES.high,
+    ACTIVE_DAILY_LOW: dailyStats.ACTIVE_ADDRESSES.low === Infinity ? 0 : dailyStats.ACTIVE_ADDRESSES.low,
+    updatedAt: Date.now()
+  };
 
-// ─── ROTATING FEED LOOP ───────────────────────────────────────────────────────
-// One metric per tick. 2 second gap between ticks.
-// Full rotation = 8 metrics x 15s interval = every ~2 minutes per metric.
-
-const feedRotation = [
-  async () => { networkFeed.ACTIVE_ADDRESSES    = await fetchActiveAddresses(); },
-  async () => { networkFeed.WHALE_TRANSFERS      = await fetchWhaleTransfers(); },
-  async () => { networkFeed.ETH_LARGE_TRANSFERS  = await fetchEthLargeTransfers(); },
-  async () => { networkFeed.LIQUIDATION_VOLUME   = await fetchLiquidationVolume(); },
-  async () => { networkFeed.STABLES_MINTED_BURNED = await fetchStablesMintedBurned(); },
-  async () => { networkFeed.NEW_WALLET_CREATION  = await fetchNewWalletCreation(); },
-  async () => { networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows(); },
-  async () => { networkFeed.DEX_VOLUME           = await fetchDexVolume(); },
-];
-
-let feedRotationIndex = 0;
-
-async function updateNetworkFeed() {
-  try {
-    const fetcher = feedRotation[feedRotationIndex];
-    console.log(`[${new Date().toISOString()}] Feed tick — metric ${feedRotationIndex}`);
-    await fetcher();
-    networkFeed.updatedAt = Date.now();
-    feedRotationIndex = (feedRotationIndex + 1) % feedRotation.length;
-  } catch (err) {
-    console.error(`  Network Feed error: ${err.message}`);
-    feedRotationIndex = (feedRotationIndex + 1) % feedRotation.length;
-  }
-}
-
-// ─── STARTUP FEED — fetch all metrics once before rounds open ─────────────────
-
-async function initNetworkFeed() {
-  console.log("Initializing feed — fetching all metrics once...");
-  for (let i = 0; i < feedRotation.length; i++) {
-    try {
-      await feedRotation[i]();
-      networkFeed.updatedAt = Date.now();
-    } catch (err) {
-      console.error(`  Init feed error metric ${i}: ${err.message}`);
-    }
-    await sleep(2000);
-  }
-  console.log("Feed initialized.", JSON.stringify(networkFeed, null, 2));
+  console.log(`  Smoothed GAS: ${latestPrices.GAS.toFixed(4)} | Smoothed TXS: ${latestPrices.TXS_PER_BLOCK.toFixed(1)}`);
+  console.log(`  GAS daily H/L: ${networkFeed.GAS_DAILY_HIGH} / ${networkFeed.GAS_DAILY_LOW}`);
+  console.log(`  TXS daily H/L: ${networkFeed.TXS_DAILY_HIGH} / ${networkFeed.TXS_DAILY_LOW}`);
+  console.log(`  ACTIVE daily H/L: ${networkFeed.ACTIVE_DAILY_HIGH} / ${networkFeed.ACTIVE_DAILY_LOW}`);
 }
 
 // ─── PERPS PRICE PUSH ─────────────────────────────────────────────────────────
 
 async function pushPrices() {
   try {
-    console.log(`[${new Date().toISOString()}] Fetching perps prices...`);
-    const gas = await fetchGas();
-    await sleep(1000);
-    const txs = await fetchTxsPerBlock();
+    const gas = rollingAverage(gasHistory);
+    const txs = rollingAverage(txsHistory);
+
+    if (gas === 0n || txs === 0n) {
+      console.log("  Skipping perps push — rolling averages not ready yet.");
+      return;
+    }
+
     await enqueue(async () => {
-      console.log(`  Pushing to chain...`);
+      console.log(`  Pushing perps to chain...`);
       const tx = await perpsContract.pushPrices([gas, 1n, txs]);
       console.log(`  TX sent: ${tx.hash}`);
       await tx.wait();
       console.log("  Perps confirmed.");
-      latestPrices = {
-        GAS: Number(gas) / 1e18,
-        TXS_PER_BLOCK: Number(txs) / 1e18,
-        updatedAt: Date.now()
-      };
-      console.log(`  GAS=${latestPrices.GAS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
     });
   } catch (err) {
     console.error(`  Perps push error: ${err.message}`);
   }
 }
+
 // ─── PREDICTION ROUND MANAGER ─────────────────────────────────────────────────
 
 const roundTracker = {};
@@ -491,12 +295,41 @@ function getRoundKey(metric, timeframe) {
   return `${metric}_${timeframe}`;
 }
 
+function getMetricCurrentValue(metricId) {
+  switch (metricId) {
+    case Metric.ACTIVE_ADDRESSES:    return networkFeed.ACTIVE_ADDRESSES || 0;
+    case Metric.ETH_LARGE_TRANSFERS: return networkFeed.GAS || 0;       // repurposed as GAS PRICE
+    case Metric.LIQUIDATION_VOLUME:  return networkFeed.TXS_PER_BLOCK || 0; // repurposed as TXS PER BLOCK
+    default: return 0;
+  }
+}
+
+function metricIsReady(metricId) {
+  const value = getMetricCurrentValue(metricId);
+  const threshold = METRIC_THRESHOLDS[metricId] || 0;
+  return value > threshold;
+}
+
+function getTimeframeDuration(timeframeId) {
+  switch (timeframeId) {
+    case Timeframe.ONE_HOUR:         return 3600;
+    case Timeframe.TWENTY_FOUR_HOUR: return 86400;
+    default: return 3600;
+  }
+}
+
 async function managePredictionRounds() {
   try {
     console.log(`[${new Date().toISOString()}] Managing prediction rounds...`);
 
-    for (const [metricName, metricId] of Object.entries(Metric)) {
-      for (const [timeframeName, timeframeId] of Object.entries(Timeframe)) {
+    const activeMetrics = [
+      Metric.ACTIVE_ADDRESSES,
+      Metric.ETH_LARGE_TRANSFERS,
+      Metric.LIQUIDATION_VOLUME
+    ];
+
+    for (const metricId of activeMetrics) {
+      for (const timeframeId of [Timeframe.ONE_HOUR, Timeframe.TWENTY_FOUR_HOUR]) {
         const key = getRoundKey(metricId, timeframeId);
         const tracked = roundTracker[key];
         const now = Math.floor(Date.now() / 1000);
@@ -507,127 +340,182 @@ async function managePredictionRounds() {
             try {
               latestId = await predictContract.getLatestRound(metricId, timeframeId);
             } catch (e) {
-              console.error(`  getLatestRound failed ${metricName} ${timeframeName}: ${e.message}`);
-              await sleep(200);
+              console.error(`  getLatestRound failed metric ${metricId} tf ${timeframeId}: ${e.message}`);
+              await sleep(300);
               continue;
             }
-            await sleep(200);
+            await sleep(300);
 
             let shouldOpen = false;
 
             if (latestId === 0n) {
               shouldOpen = true;
             } else {
+              let round;
               try {
-                const round = await predictContract.rounds(latestId);
-                await sleep(200);
-                if (Number(round.status) === RoundStatus.OPEN) {
-                  roundTracker[key] = { roundId: latestId, closeTime: Number(round.closeTime) };
-                  console.log(`  Loaded existing round: ${metricName} ${timeframeName} ID=${latestId}`);
-                } else {
-                  shouldOpen = true;
-                }
+                round = await predictContract.rounds(latestId);
               } catch (e) {
-                console.error(`  rounds() failed ${metricName} ${timeframeName}: ${e.message}`);
-                await sleep(200);
+                console.error(`  rounds() failed id ${latestId}: ${e.message}`);
+                await sleep(300);
                 continue;
+              }
+              await sleep(300);
+
+              const status = Number(round.status);
+              const closeTime = Number(round.closeTime);
+
+              if (status === RoundStatus.OPEN && now >= closeTime) {
+                // Needs resolving
+                if (!metricIsReady(metricId)) {
+                  console.log(`  Metric ${metricId} not ready — skipping resolve`);
+                  continue;
+                }
+                const endValue = toScaled(getMetricCurrentValue(metricId));
+                await enqueue(async () => {
+                  console.log(`  Resolving round ${latestId} metric ${metricId} tf ${timeframeId}`);
+                  const tx = await predictContract.resolveRound(latestId, endValue);
+                  console.log(`  Resolve TX: ${tx.hash}`);
+                  await tx.wait();
+                  console.log(`  Resolved.`);
+                });
+                shouldOpen = true;
+              } else if (status === RoundStatus.OPEN && now < closeTime) {
+                roundTracker[key] = { roundId: latestId, closeTime };
+                console.log(`  Round ${latestId} still open — closes in ${closeTime - now}s`);
+                continue;
+              } else {
+                shouldOpen = true;
               }
             }
 
             if (shouldOpen) {
               if (!metricIsReady(metricId)) {
-                console.log(`  Feed not ready for ${metricName} — skipping round open`);
+                console.log(`  Metric ${metricId} not ready — skipping open`);
                 continue;
               }
-              const startValue = getCurrentMetricValue(metricId);
-              console.log(`  Opening round: ${metricName} ${timeframeName} startValue=${startValue}`);
+              const startValue = toScaled(getMetricCurrentValue(metricId));
+              const duration = getTimeframeDuration(timeframeId);
               await enqueue(async () => {
-                try {
-                  const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                  console.log(`  TX sent openRound ${metricName} ${timeframeName}: ${tx.hash}`);
-                  await tx.wait();
-                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                  const newRound = await predictContract.rounds(newId);
-                  roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-                  console.log(`  Opened round: ${metricName} ${timeframeName} ID=${newId} closes=${newRound.closeTime}`);
-                } catch (e) {
-                  console.error(`  openRound FAILED ${metricName} ${timeframeName}: ${e.message}`);
-                }
+                console.log(`  Opening round metric ${metricId} tf ${timeframeId} startValue ${startValue}`);
+                const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                console.log(`  Open TX: ${tx.hash}`);
+                const receipt = await tx.wait();
+                const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                roundTracker[key] = { roundId: newId, closeTime: now + duration };
+                console.log(`  Round opened. ID: ${newId}`);
               });
             }
 
           } else {
+            // Already tracked
             if (now >= tracked.closeTime) {
+              console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — time to resolve`);
               if (!metricIsReady(metricId)) {
-                console.log(`  Feed not ready for ${metricName} — skipping resolve/reopen`);
+                console.log(`  Metric ${metricId} not ready — skipping resolve`);
                 continue;
               }
-              const endValue = getCurrentMetricValue(metricId);
-              const startValue = getCurrentMetricValue(metricId);
+              const endValue = toScaled(getMetricCurrentValue(metricId));
+              const duration = getTimeframeDuration(timeframeId);
               await enqueue(async () => {
-                try {
-                  const tx = await predictContract.resolveRound(tracked.roundId, endValue);
-                  console.log(`  TX sent resolveRound ${metricName} ${timeframeName}: ${tx.hash}`);
-                  await tx.wait();
-                  console.log(`  Resolved: ${metricName} ${timeframeName} ID=${tracked.roundId}`);
-                  const tx2 = await predictContract.openRound(metricId, timeframeId, startValue);
-                  console.log(`  TX sent openRound next ${metricName} ${timeframeName}: ${tx2.hash}`);
-                  await tx2.wait();
-                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                  const newRound = await predictContract.rounds(newId);
-                  roundTracker[key] = { roundId: newId, closeTime: Number(newRound.closeTime) };
-                  console.log(`  Opened next: ${metricName} ${timeframeName} ID=${newId}`);
-                } catch (e) {
-                  console.error(`  resolve/open FAILED ${metricName} ${timeframeName}: ${e.message}`);
-                }
+                console.log(`  Resolving round ${tracked.roundId}`);
+                const tx = await predictContract.resolveRound(tracked.roundId, endValue);
+                console.log(`  Resolve TX: ${tx.hash}`);
+                await tx.wait();
+                console.log(`  Resolved.`);
               });
+              delete roundTracker[key];
+
+              // Open next round immediately
+              if (metricIsReady(metricId)) {
+                const startValue = toScaled(getMetricCurrentValue(metricId));
+                const nowAfter = Math.floor(Date.now() / 1000);
+                await enqueue(async () => {
+                  console.log(`  Opening next round metric ${metricId} tf ${timeframeId}`);
+                  const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                  console.log(`  Open TX: ${tx.hash}`);
+                  await tx.wait();
+                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                  roundTracker[key] = { roundId: newId, closeTime: nowAfter + duration };
+                  console.log(`  Round opened. ID: ${newId}`);
+                });
+              }
+            } else {
+              console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — closes in ${tracked.closeTime - now}s`);
             }
           }
 
-        } catch (e) {
-          console.error(`  Loop error ${metricName} ${timeframeName}: ${e.message}`);
+        } catch (err) {
+          console.error(`  Round manager error metric ${metricId} tf ${timeframeId}: ${err.message}`);
+          await sleep(300);
         }
-
-        await sleep(200);
       }
     }
   } catch (err) {
-    console.error(`  Prediction round error: ${err.message}`);
+    console.error(`  managePredictionRounds error: ${err.message}`);
   }
 }
 
 // ─── HTTP SERVER ──────────────────────────────────────────────────────────────
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "application/json");
-  const url = req.url?.split("?")[0];
-  if (url === "/feed") {
+
+  if (req.url === "/") {
+    res.end(JSON.stringify({
+      GAS: latestPrices.GAS,
+      TXS_PER_BLOCK: latestPrices.TXS_PER_BLOCK,
+      updatedAt: latestPrices.updatedAt
+    }));
+
+  } else if (req.url === "/feed") {
     res.end(JSON.stringify(networkFeed));
-  } else if (url === "/rounds") {
-    res.end(JSON.stringify(roundTracker));
+
+  } else if (req.url === "/rounds") {
+    const out = {};
+    for (const [key, val] of Object.entries(roundTracker)) {
+      out[key] = {
+        roundId: val.roundId?.toString(),
+        closeTime: val.closeTime
+      };
+    }
+    res.end(JSON.stringify(out));
+
   } else {
-    res.end(JSON.stringify(latestPrices));
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: "Not found" }));
   }
-}).listen(process.env.PORT || 3000, () => {
-  console.log(`ChainFlux Keeper running on port ${process.env.PORT || 3000}`);
 });
 
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
+server.listen(3000, () => {
+  console.log("Keeper server running on port 3000");
+});
+
+// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log("ChainFlux Keeper starting...");
 
-  await initNetworkFeed();
+  // Warm up rolling averages before doing anything on chain
+  console.log("Warming up rolling averages (5 blocks)...");
+  for (let i = 0; i < 5; i++) {
+    await updateAllMetrics();
+    await sleep(3000);
+  }
+  console.log("Warmup complete.");
 
-  setTimeout(async () => {
+  let tick = 0;
+
+  setInterval(async () => {
+    tick++;
+    console.log(`\n── Tick ${tick} ──`);
+    await updateAllMetrics();
+    await pushPrices();
     await managePredictionRounds();
-    setInterval(managePredictionRounds, 60000);
-  }, 30000);
-
-  await pushPrices();
-  setInterval(pushPrices, INTERVAL_MS);
-  setInterval(updateNetworkFeed, INTERVAL_MS);
+  }, INTERVAL_MS);
 }
 
-main().catch(console.error);
+main().catch(err => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
