@@ -425,11 +425,12 @@ async function managePredictionRounds() {
               });
               delete roundTracker[key];
 
-              // Open next round immediately
-              if (metricIsReady(metricId)) {
-                const startValue = toScaled(getMetricCurrentValue(metricId));
-                const nowAfter = Math.floor(Date.now() / 1000);
-                await enqueue(async () => {
+            // Open next round immediately
+if (metricIsReady(metricId)) {
+  const startValue = toScaled(getMetricCurrentValue(metricId));
+  const nowAfter = Math.floor(Date.now() / 1000);
+  await sleep(4000);
+  await enqueue(async () => {
                   console.log(`  Opening next round metric ${metricId} tf ${timeframeId}`);
                   const tx = await predictContract.openRound(metricId, timeframeId, startValue);
                   console.log(`  Open TX: ${tx.hash}`);
