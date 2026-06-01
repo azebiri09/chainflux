@@ -61,14 +61,14 @@ const RoundStatus = {
 // ─── MINIMUM THRESHOLDS ───────────────────────────────────────────────────────
 
 const METRIC_THRESHOLDS = {
-  [Metric.ACTIVE_ADDRESSES]:      10,
-  [Metric.WHALE_TRANSFERS]:        2,
-  [Metric.ETH_LARGE_TRANSFERS]:    2,
-  [Metric.LIQUIDATION_VOLUME]:     1,
-  [Metric.STABLES_MINTED_BURNED]: 100,
-  [Metric.NEW_WALLET_CREATION]:    2,
+  [Metric.ACTIVE_ADDRESSES]:        10,
+  [Metric.WHALE_TRANSFERS]:          2,
+  [Metric.ETH_LARGE_TRANSFERS]:      2,
+  [Metric.LIQUIDATION_VOLUME]:       1,
+  [Metric.STABLES_MINTED_BURNED]:  100,
+  [Metric.NEW_WALLET_CREATION]:      2,
   [Metric.BRIDGE_INFLOWS_OUTFLOWS]: 0.05,
-  [Metric.DEX_VOLUME]:             2
+  [Metric.DEX_VOLUME]:               2
 };
 
 function metricIsReady(metricId) {
@@ -189,17 +189,13 @@ async function fetchGas() {
     const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_gasPrice&apikey=${ETHERSCAN_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
-
     if (!data.result || typeof data.result !== "string" || !data.result.startsWith("0x")) {
       throw new Error("bad gas response");
     }
-
     const rawGwei = Number(BigInt(data.result)) / 1e9;
     const scaled = BigInt(Math.round(rawGwei * 1e18));
-
     pushToWindow(gasHistory, scaled, GAS_WINDOW);
     const smoothed = rollingAverage(gasHistory);
-
     console.log(`  GAS: ${rawGwei.toFixed(4)} gwei | smoothed: ${Number(smoothed) / 1e18}`);
     return smoothed;
   } catch (err) {
@@ -215,16 +211,12 @@ async function fetchTxsPerBlock() {
     const url = `https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=latest&boolean=false&apikey=${ETHERSCAN_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
-
     const txs = data?.result?.transactions ?? [];
     const count = txs.length;
-
     if (count === 0) throw new Error("empty block");
-
     const scaled = BigInt(count) * PRICE_PRECISION;
     pushToWindow(txsHistory, scaled, TXS_WINDOW);
     const smoothed = rollingAverage(txsHistory);
-
     console.log(`  TXS PER BLOCK: ${count} | smoothed: ${Number(smoothed) / 1e18}`);
     return smoothed;
   } catch (err) {
@@ -233,11 +225,11 @@ async function fetchTxsPerBlock() {
   }
 }
 
-// ─── FEED: ACTIVE ADDRESSES ───────────────────────────────────────────────────
+// ─── FEED FETCHERS ────────────────────────────────────────────────────────────
 
 async function fetchActiveAddresses() {
   try {
-    const { fromBlock, toBlock, latestBlock } = await getBlockRange(500);
+    const { latestBlock } = await getBlockRange(5);
     const addressSet = new Set();
     for (let i = 0; i < 5; i++) {
       const tag = toHex(latestBlock - i);
@@ -249,7 +241,7 @@ async function fetchActiveAddresses() {
         if (tx.from) addressSet.add(tx.from.toLowerCase());
         if (tx.to) addressSet.add(tx.to.toLowerCase());
       }
-      await sleep(600);
+      await sleep(1000);
     }
     const count = addressSet.size;
     console.log(`  ACTIVE_ADDRESSES: ${count}`);
@@ -260,18 +252,16 @@ async function fetchActiveAddresses() {
   }
 }
 
-// ─── FEED: WHALE TRANSFERS ────────────────────────────────────────────────────
-
 async function fetchWhaleTransfers() {
   try {
     const { fromBlock, toBlock } = await getBlockRange(50);
-    const WHALE_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
     const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
-    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${WETH}&topic0=${WHALE_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
+    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const url = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${WETH}&topic0=${TRANSFER_TOPIC}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
     if (!Array.isArray(data?.result)) throw new Error("bad whale response");
-    const WHALE_THRESHOLD = BigInt("100000000000000000000"); // 100 ETH
+    const WHALE_THRESHOLD = BigInt("100000000000000000000");
     let whaleCount = 0;
     for (const log of data.result) {
       try {
@@ -286,8 +276,6 @@ async function fetchWhaleTransfers() {
   }
 }
 
-// ─── FEED: ETH LARGE TRANSFERS ────────────────────────────────────────────────
-
 async function fetchEthLargeTransfers() {
   try {
     const { fromBlock, toBlock } = await getBlockRange(200);
@@ -297,22 +285,20 @@ async function fetchEthLargeTransfers() {
     const res = await fetch(url);
     const data = await res.json();
     if (!Array.isArray(data?.result)) throw new Error("bad eth large response");
-    const LARGE_THRESHOLD = BigInt("10000000000000000000"); // 10 ETH
+    const LARGE_THRESHOLD = BigInt("10000000000000000000");
     let largeCount = 0;
     for (const log of data.result) {
       try {
         if (BigInt(log.data) >= LARGE_THRESHOLD) largeCount++;
       } catch {}
     }
-    console.log(`  ETH_LARGE_TRANSFERS: ${largeCount} transfers >= 10 ETH over last 200 blocks`);
+    console.log(`  ETH_LARGE_TRANSFERS: ${largeCount} over last 200 blocks`);
     return largeCount || networkFeed.ETH_LARGE_TRANSFERS || 0;
   } catch (err) {
     console.error(`  ETH_LARGE_TRANSFERS error: ${err.message}`);
     return networkFeed.ETH_LARGE_TRANSFERS || 0;
   }
 }
-
-// ─── FEED: LIQUIDATION VOLUME ─────────────────────────────────────────────────
 
 async function fetchLiquidationVolume() {
   try {
@@ -332,8 +318,6 @@ async function fetchLiquidationVolume() {
   }
 }
 
-// ─── FEED: STABLES MINTED/BURNED ─────────────────────────────────────────────
-
 async function fetchStablesMintedBurned() {
   try {
     const { fromBlock, toBlock } = await getBlockRange(200);
@@ -341,10 +325,13 @@ async function fetchStablesMintedBurned() {
     const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
     const ZERO = "0x0000000000000000000000000000000000000000000000000000000000000000";
     const urlMint = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${USDC}&topic0=${TRANSFER_TOPIC}&topic1=${ZERO}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
+    await sleep(1000);
     const urlBurn = `https://api.etherscan.io/v2/api?chainid=1&module=logs&action=getLogs&address=${USDC}&topic0=${TRANSFER_TOPIC}&topic2=${ZERO}&fromBlock=${fromBlock}&toBlock=${toBlock}&apikey=${ETHERSCAN_API_KEY}`;
-    await sleep(600);
-    const [resMint, resBurn] = await Promise.all([fetch(urlMint), fetch(urlBurn)]);
-    const [dataMint, dataBurn] = await Promise.all([resMint.json(), resBurn.json()]);
+    const resMint = await fetch(urlMint);
+    const dataMint = await resMint.json();
+    await sleep(1000);
+    const resBurn = await fetch(urlBurn);
+    const dataBurn = await resBurn.json();
     if (!Array.isArray(dataMint?.result) && !Array.isArray(dataBurn?.result)) throw new Error("bad stables response");
     let totalUsdc = 0;
     for (const log of [...(Array.isArray(dataMint?.result) ? dataMint.result : []), ...(Array.isArray(dataBurn?.result) ? dataBurn.result : [])]) {
@@ -361,8 +348,6 @@ async function fetchStablesMintedBurned() {
   }
 }
 
-// ─── FEED: NEW WALLET CREATION ────────────────────────────────────────────────
-
 async function fetchNewWalletCreation() {
   try {
     const { latestBlock } = await getBlockRange(20);
@@ -376,7 +361,7 @@ async function fetchNewWalletCreation() {
       for (const tx of txs) {
         if (!tx.to || tx.to === "" || tx.to === null) newContracts++;
       }
-      await sleep(600);
+      await sleep(1000);
     }
     console.log(`  NEW_WALLET_CREATION: ${newContracts} deployments in last 20 blocks`);
     return newContracts || networkFeed.NEW_WALLET_CREATION || 0;
@@ -385,8 +370,6 @@ async function fetchNewWalletCreation() {
     return networkFeed.NEW_WALLET_CREATION || 0;
   }
 }
-
-// ─── FEED: BRIDGE INFLOWS ─────────────────────────────────────────────────────
 
 async function fetchBridgeInflows() {
   try {
@@ -411,8 +394,6 @@ async function fetchBridgeInflows() {
   }
 }
 
-// ─── FEED: DEX VOLUME ─────────────────────────────────────────────────────────
-
 async function fetchDexVolume() {
   try {
     const { fromBlock, toBlock } = await getBlockRange(100);
@@ -431,45 +412,50 @@ async function fetchDexVolume() {
   }
 }
 
-// ─── NETWORK FEED LOOP ────────────────────────────────────────────────────────
+// ─── ROTATING FEED LOOP ───────────────────────────────────────────────────────
+// One metric per tick. 2 second gap between ticks.
+// Full rotation = 8 metrics x 15s interval = every ~2 minutes per metric.
 
-let feedTick = 0;
+const feedRotation = [
+  async () => { networkFeed.ACTIVE_ADDRESSES    = await fetchActiveAddresses(); },
+  async () => { networkFeed.WHALE_TRANSFERS      = await fetchWhaleTransfers(); },
+  async () => { networkFeed.ETH_LARGE_TRANSFERS  = await fetchEthLargeTransfers(); },
+  async () => { networkFeed.LIQUIDATION_VOLUME   = await fetchLiquidationVolume(); },
+  async () => { networkFeed.STABLES_MINTED_BURNED = await fetchStablesMintedBurned(); },
+  async () => { networkFeed.NEW_WALLET_CREATION  = await fetchNewWalletCreation(); },
+  async () => { networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows(); },
+  async () => { networkFeed.DEX_VOLUME           = await fetchDexVolume(); },
+];
+
+let feedRotationIndex = 0;
 
 async function updateNetworkFeed() {
   try {
-    feedTick++;
-    console.log(`[${new Date().toISOString()}] Network Feed tick ${feedTick}`);
-
-    networkFeed.ACTIVE_ADDRESSES = await fetchActiveAddresses();
-    await sleep(600);
-
-    networkFeed.WHALE_TRANSFERS = await fetchWhaleTransfers();
-    await sleep(600);
-
-    networkFeed.ETH_LARGE_TRANSFERS = await fetchEthLargeTransfers();
-    await sleep(600);
-
-    networkFeed.LIQUIDATION_VOLUME = await fetchLiquidationVolume();
-    await sleep(600);
-
-    networkFeed.STABLES_MINTED_BURNED = await fetchStablesMintedBurned();
-    await sleep(600);
-
-    networkFeed.NEW_WALLET_CREATION = await fetchNewWalletCreation();
-    await sleep(600);
-
-    if (feedTick % 4 === 0) {
-      networkFeed.BRIDGE_INFLOWS_OUTFLOWS = await fetchBridgeInflows();
-      await sleep(600);
-      networkFeed.DEX_VOLUME = await fetchDexVolume();
-      await sleep(600);
-    }
-
+    const fetcher = feedRotation[feedRotationIndex];
+    console.log(`[${new Date().toISOString()}] Feed tick — metric ${feedRotationIndex}`);
+    await fetcher();
     networkFeed.updatedAt = Date.now();
-
+    feedRotationIndex = (feedRotationIndex + 1) % feedRotation.length;
   } catch (err) {
     console.error(`  Network Feed error: ${err.message}`);
+    feedRotationIndex = (feedRotationIndex + 1) % feedRotation.length;
   }
+}
+
+// ─── STARTUP FEED — fetch all metrics once before rounds open ─────────────────
+
+async function initNetworkFeed() {
+  console.log("Initializing feed — fetching all metrics once...");
+  for (let i = 0; i < feedRotation.length; i++) {
+    try {
+      await feedRotation[i]();
+      networkFeed.updatedAt = Date.now();
+    } catch (err) {
+      console.error(`  Init feed error metric ${i}: ${err.message}`);
+    }
+    await sleep(2000);
+  }
+  console.log("Feed initialized.", JSON.stringify(networkFeed, null, 2));
 }
 
 // ─── PERPS PRICE PUSH ─────────────────────────────────────────────────────────
@@ -477,32 +463,26 @@ async function updateNetworkFeed() {
 async function pushPrices() {
   try {
     console.log(`[${new Date().toISOString()}] Fetching perps prices...`);
-
     const gas = await fetchGas();
-    await sleep(600);
+    await sleep(1000);
     const txs = await fetchTxsPerBlock();
-
     await enqueue(async () => {
       console.log(`  Pushing to chain...`);
       const tx = await perpsContract.pushPrices([gas, 1n, txs]);
       console.log(`  TX sent: ${tx.hash}`);
       await tx.wait();
       console.log("  Perps confirmed.");
-
       latestPrices = {
         GAS: Number(gas) / 1e18,
         TXS_PER_BLOCK: Number(txs) / 1e18,
         updatedAt: Date.now()
       };
-
       console.log(`  GAS=${latestPrices.GAS} | TXS=${latestPrices.TXS_PER_BLOCK}`);
     });
-
   } catch (err) {
     console.error(`  Perps push error: ${err.message}`);
   }
 }
-
 // ─── PREDICTION ROUND MANAGER ─────────────────────────────────────────────────
 
 const roundTracker = {};
@@ -621,9 +601,7 @@ async function managePredictionRounds() {
 http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "application/json");
-
   const url = req.url?.split("?")[0];
-
   if (url === "/feed") {
     res.end(JSON.stringify(networkFeed));
   } else if (url === "/rounds") {
@@ -631,7 +609,6 @@ http.createServer((req, res) => {
   } else {
     res.end(JSON.stringify(latestPrices));
   }
-
 }).listen(process.env.PORT || 3000, () => {
   console.log(`ChainFlux Keeper running on port ${process.env.PORT || 3000}`);
 });
@@ -641,12 +618,12 @@ http.createServer((req, res) => {
 async function main() {
   console.log("ChainFlux Keeper starting...");
 
-  await updateNetworkFeed();
+  await initNetworkFeed();
 
   setTimeout(async () => {
     await managePredictionRounds();
     setInterval(managePredictionRounds, 60000);
-  }, 120000);
+  }, 30000);
 
   await pushPrices();
   setInterval(pushPrices, INTERVAL_MS);
