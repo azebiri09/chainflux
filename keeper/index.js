@@ -6,6 +6,7 @@ import http from "http";
 
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY;
 const KEEPER_PRIVATE_KEY = process.env.KEEPER_PRIVATE_KEY;
+const PORT = process.env.PORT || 3000;
 
 const PROXY_ADDRESS = "0x615d3801019D33609Eed27EB39D40AB49fa44fAF";
 const PREDICT_PROXY_ADDRESS = "0x7708a4C85F526E23090d3B27201487E91AF58694";
@@ -99,10 +100,6 @@ function toScaled(value) {
   return BigInt(Math.round(value * 1e4)) * (PRICE_PRECISION / BigInt(1e4));
 }
 
-function toHex(num) {
-  return "0x" + num.toString(16);
-}
-
 // ─── ROLLING AVERAGES ─────────────────────────────────────────────────────────
 
 const GAS_WINDOW = 20;
@@ -172,7 +169,6 @@ let networkFeed = {
 };
 
 // ─── SINGLE BLOCK FETCH ───────────────────────────────────────────────────────
-// One call. All 3 metrics extracted from the same block.
 
 async function fetchBlockData() {
   try {
@@ -183,16 +179,13 @@ async function fetchBlockData() {
 
     if (!block) throw new Error("No block returned");
 
-    // GAS — baseFeePerGas in gwei
     const baseFeeHex = block.baseFeePerGas || "0x0";
     const rawGwei = Number(BigInt(baseFeeHex)) / 1e9;
     const gasGwei = rawGwei > 0 ? rawGwei : (latestPrices.GAS > 0 ? latestPrices.GAS : 0.3);
 
-    // TXS PER BLOCK — transaction count
     const txs = block.transactions ?? [];
     const txCount = txs.length > 0 ? txs.length : (latestPrices.TXS_PER_BLOCK > 0 ? latestPrices.TXS_PER_BLOCK : 200);
 
-    // ACTIVE ADDRESSES — unique from/to in this block
     const addressSet = new Set();
     for (const tx of txs) {
       if (tx.from) addressSet.add(tx.from.toLowerCase());
@@ -224,7 +217,6 @@ async function updateAllMetrics() {
 
   const { gasGwei, txCount, activeCount } = await fetchBlockData();
 
-  // Rolling averages for perps
   const gasScaled = BigInt(Math.round(gasGwei * 1e18));
   const txsScaled = BigInt(txCount) * PRICE_PRECISION;
   pushToWindow(gasHistory, gasScaled, GAS_WINDOW);
@@ -232,12 +224,10 @@ async function updateAllMetrics() {
   const smoothedGas = rollingAverage(gasHistory);
   const smoothedTxs = rollingAverage(txsHistory);
 
-  // Update daily stats
   updateDailyStats("GAS", gasGwei);
   updateDailyStats("TXS_PER_BLOCK", txCount);
   updateDailyStats("ACTIVE_ADDRESSES", activeCount);
 
-  // Update caches
   latestPrices = {
     GAS: Number(smoothedGas) / 1e18,
     TXS_PER_BLOCK: Number(smoothedTxs) / 1e18,
@@ -275,15 +265,14 @@ async function pushPrices() {
       return;
     }
 
-    await enqueue(async () => {
-      console.log(`  Pushing perps to chain...`);
-      const tx = await perpsContract.pushPrices([gas, 1n, txs]);
-      console.log(`  TX sent: ${tx.hash}`);
-      await tx.wait();
-      console.log("  Perps confirmed.");
-    });
+    console.log("  Pushing perps to chain...");
+    const tx = await perpsContract.pushPrices([gas, 1n, txs]);
+    console.log(`  TX sent: ${tx.hash}`);
+    await tx.wait();
+    console.log("  Perps confirmed.");
+
   } catch (err) {
-    console.error(`  Perps push error: ${err.message}`);
+    console.error(`  Perps push error (non-fatal): ${err.message?.slice(0, 120)}`);
   }
 }
 
@@ -298,8 +287,8 @@ function getRoundKey(metric, timeframe) {
 function getMetricCurrentValue(metricId) {
   switch (metricId) {
     case Metric.ACTIVE_ADDRESSES:    return networkFeed.ACTIVE_ADDRESSES || 0;
-    case Metric.ETH_LARGE_TRANSFERS: return networkFeed.GAS || 0;       // repurposed as GAS PRICE
-    case Metric.LIQUIDATION_VOLUME:  return networkFeed.TXS_PER_BLOCK || 0; // repurposed as TXS PER BLOCK
+    case Metric.ETH_LARGE_TRANSFERS: return networkFeed.GAS || 0;
+    case Metric.LIQUIDATION_VOLUME:  return networkFeed.TXS_PER_BLOCK || 0;
     default: return 0;
   }
 }
@@ -340,7 +329,7 @@ async function managePredictionRounds() {
             try {
               latestId = await predictContract.getLatestRound(metricId, timeframeId);
             } catch (e) {
-              console.error(`  getLatestRound failed metric ${metricId} tf ${timeframeId}: ${e.message}`);
+              console.error(`  getLatestRound failed metric ${metricId} tf ${timeframeId}: ${e.message?.slice(0, 80)}`);
               await sleep(300);
               continue;
             }
@@ -355,7 +344,7 @@ async function managePredictionRounds() {
               try {
                 round = await predictContract.rounds(latestId);
               } catch (e) {
-                console.error(`  rounds() failed id ${latestId}: ${e.message}`);
+                console.error(`  rounds() failed id ${latestId}: ${e.message?.slice(0, 80)}`);
                 await sleep(300);
                 continue;
               }
@@ -365,19 +354,22 @@ async function managePredictionRounds() {
               const closeTime = Number(round.closeTime);
 
               if (status === RoundStatus.OPEN && now >= closeTime) {
-                // Needs resolving
                 if (!metricIsReady(metricId)) {
                   console.log(`  Metric ${metricId} not ready — skipping resolve`);
                   continue;
                 }
                 const endValue = toScaled(getMetricCurrentValue(metricId));
-                await enqueue(async () => {
-                  console.log(`  Resolving round ${latestId} metric ${metricId} tf ${timeframeId}`);
-                  const tx = await predictContract.resolveRound(latestId, endValue);
-                  console.log(`  Resolve TX: ${tx.hash}`);
-                  await tx.wait();
-                  console.log(`  Resolved.`);
-                });
+                try {
+                  await enqueue(async () => {
+                    console.log(`  Resolving round ${latestId} metric ${metricId} tf ${timeframeId}`);
+                    const tx = await predictContract.resolveRound(latestId, endValue);
+                    console.log(`  Resolve TX: ${tx.hash}`);
+                    await tx.wait();
+                    console.log(`  Resolved.`);
+                  });
+                } catch (e) {
+                  console.error(`  Resolve failed (non-fatal): ${e.message?.slice(0, 80)}`);
+                }
                 shouldOpen = true;
               } else if (status === RoundStatus.OPEN && now < closeTime) {
                 roundTracker[key] = { roundId: latestId, closeTime };
@@ -395,19 +387,22 @@ async function managePredictionRounds() {
               }
               const startValue = toScaled(getMetricCurrentValue(metricId));
               const duration = getTimeframeDuration(timeframeId);
-              await enqueue(async () => {
-                console.log(`  Opening round metric ${metricId} tf ${timeframeId} startValue ${startValue}`);
-                const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                console.log(`  Open TX: ${tx.hash}`);
-                const receipt = await tx.wait();
-                const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                roundTracker[key] = { roundId: newId, closeTime: now + duration };
-                console.log(`  Round opened. ID: ${newId}`);
-              });
+              try {
+                await enqueue(async () => {
+                  console.log(`  Opening round metric ${metricId} tf ${timeframeId} startValue ${startValue}`);
+                  const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                  console.log(`  Open TX: ${tx.hash}`);
+                  await tx.wait();
+                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                  roundTracker[key] = { roundId: newId, closeTime: now + duration };
+                  console.log(`  Round opened. ID: ${newId}`);
+                });
+              } catch (e) {
+                console.error(`  Open round failed (non-fatal): ${e.message?.slice(0, 80)}`);
+              }
             }
 
           } else {
-            // Already tracked
             if (now >= tracked.closeTime) {
               console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — time to resolve`);
               if (!metricIsReady(metricId)) {
@@ -416,29 +411,36 @@ async function managePredictionRounds() {
               }
               const endValue = toScaled(getMetricCurrentValue(metricId));
               const duration = getTimeframeDuration(timeframeId);
-              await enqueue(async () => {
-                console.log(`  Resolving round ${tracked.roundId}`);
-                const tx = await predictContract.resolveRound(tracked.roundId, endValue);
-                console.log(`  Resolve TX: ${tx.hash}`);
-                await tx.wait();
-                console.log(`  Resolved.`);
-              });
+              try {
+                await enqueue(async () => {
+                  console.log(`  Resolving round ${tracked.roundId}`);
+                  const tx = await predictContract.resolveRound(tracked.roundId, endValue);
+                  console.log(`  Resolve TX: ${tx.hash}`);
+                  await tx.wait();
+                  console.log(`  Resolved.`);
+                });
+              } catch (e) {
+                console.error(`  Resolve failed (non-fatal): ${e.message?.slice(0, 80)}`);
+              }
               delete roundTracker[key];
 
-            // Open next round immediately
-if (metricIsReady(metricId)) {
-  const startValue = toScaled(getMetricCurrentValue(metricId));
-  const nowAfter = Math.floor(Date.now() / 1000);
-  await sleep(4000);
-  await enqueue(async () => {
-                  console.log(`  Opening next round metric ${metricId} tf ${timeframeId}`);
-                  const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                  console.log(`  Open TX: ${tx.hash}`);
-                  await tx.wait();
-                  const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                  roundTracker[key] = { roundId: newId, closeTime: nowAfter + duration };
-                  console.log(`  Round opened. ID: ${newId}`);
-                });
+              if (metricIsReady(metricId)) {
+                const startValue = toScaled(getMetricCurrentValue(metricId));
+                const nowAfter = Math.floor(Date.now() / 1000);
+                await sleep(4000);
+                try {
+                  await enqueue(async () => {
+                    console.log(`  Opening next round metric ${metricId} tf ${timeframeId}`);
+                    const tx = await predictContract.openRound(metricId, timeframeId, startValue);
+                    console.log(`  Open TX: ${tx.hash}`);
+                    await tx.wait();
+                    const newId = await predictContract.getLatestRound(metricId, timeframeId);
+                    roundTracker[key] = { roundId: newId, closeTime: nowAfter + duration };
+                    console.log(`  Round opened. ID: ${newId}`);
+                  });
+                } catch (e) {
+                  console.error(`  Open next round failed (non-fatal): ${e.message?.slice(0, 80)}`);
+                }
               }
             } else {
               console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — closes in ${tracked.closeTime - now}s`);
@@ -446,7 +448,7 @@ if (metricIsReady(metricId)) {
           }
 
         } catch (err) {
-          console.error(`  Round manager error metric ${metricId} tf ${timeframeId}: ${err.message}`);
+          console.error(`  Round manager error metric ${metricId} tf ${timeframeId}: ${err.message?.slice(0, 80)}`);
           await sleep(300);
         }
       }
@@ -468,10 +470,8 @@ const server = http.createServer((req, res) => {
       TXS_PER_BLOCK: latestPrices.TXS_PER_BLOCK,
       updatedAt: latestPrices.updatedAt
     }));
-
   } else if (req.url === "/feed") {
     res.end(JSON.stringify(networkFeed));
-
   } else if (req.url === "/rounds") {
     const out = {};
     for (const [key, val] of Object.entries(roundTracker)) {
@@ -481,15 +481,14 @@ const server = http.createServer((req, res) => {
       };
     }
     res.end(JSON.stringify(out));
-
   } else {
     res.writeHead(404);
     res.end(JSON.stringify({ error: "Not found" }));
   }
 });
 
-server.listen(3000, () => {
-  console.log("Keeper server running on port 3000");
+server.listen(PORT, () => {
+  console.log(`Keeper server running on port ${PORT}`);
 });
 
 // ─── MAIN LOOP ────────────────────────────────────────────────────────────────
@@ -497,7 +496,6 @@ server.listen(3000, () => {
 async function main() {
   console.log("ChainFlux Keeper starting...");
 
-  // Warm up rolling averages before doing anything on chain
   console.log("Warming up rolling averages (5 blocks)...");
   for (let i = 0; i < 5; i++) {
     await updateAllMetrics();
