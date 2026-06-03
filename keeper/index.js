@@ -2,8 +2,6 @@ import { ethers } from "ethers";
 import fetch from "node-fetch";
 import http from "http";
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY;
 const KEEPER_PRIVATE_KEY = process.env.KEEPER_PRIVATE_KEY;
 const PORT = process.env.PORT || 3000;
@@ -14,8 +12,6 @@ const RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc";
 
 const PRICE_PRECISION = BigInt("1000000000000000000");
 const INTERVAL_MS = 15000;
-
-// ─── ABIs ─────────────────────────────────────────────────────────────────────
 
 const PERPS_ABI = [
   "function pushPrices(uint256[3] calldata prices) external"
@@ -28,19 +24,15 @@ const PREDICT_ABI = [
   "function rounds(uint256 roundId) external view returns (uint256 id, uint8 metric, uint8 timeframe, uint256 startValue, uint256 endValue, uint256 openTime, uint256 closeTime, uint256 higherPool, uint256 lowerPool, uint8 status, uint8 result)"
 ];
 
-// ─── PROVIDER + CONTRACTS ─────────────────────────────────────────────────────
-
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(KEEPER_PRIVATE_KEY, provider);
 const perpsContract = new ethers.Contract(PROXY_ADDRESS, PERPS_ABI, wallet);
 const predictContract = new ethers.Contract(PREDICT_PROXY_ADDRESS, PREDICT_ABI, wallet);
 
-// ─── ENUMS ────────────────────────────────────────────────────────────────────
-
 const Metric = {
   ACTIVE_ADDRESSES: 0,
-  ETH_LARGE_TRANSFERS: 2,
-  LIQUIDATION_VOLUME: 3
+  GAS_PRICE: 2,
+  TXS_PER_BLOCK: 3
 };
 
 const Timeframe = {
@@ -51,18 +43,16 @@ const Timeframe = {
 const RoundStatus = {
   OPEN: 0,
   RESOLVED: 1,
-  REFUNDED: 2
+  CANCELLED: 2
 };
-
-// ─── THRESHOLDS ───────────────────────────────────────────────────────────────
 
 const METRIC_THRESHOLDS = {
   [Metric.ACTIVE_ADDRESSES]: 10,
-  [Metric.ETH_LARGE_TRANSFERS]: 0.1,
-  [Metric.LIQUIDATION_VOLUME]: 50
+  [Metric.GAS_PRICE]: 0.01,
+  [Metric.TXS_PER_BLOCK]: 1
 };
 
-// ─── TRANSACTION QUEUE ────────────────────────────────────────────────────────
+// ─── TX QUEUE ─────────────────────────────────────────────────────────────────
 
 const txQueue = [];
 let txBusy = false;
@@ -75,29 +65,46 @@ async function enqueue(fn) {
 }
 
 async function processQueue() {
-  if (txQueue.length === 0) {
-    txBusy = false;
-    return;
-  }
+  if (txQueue.length === 0) { txBusy = false; return; }
   txBusy = true;
   const { fn, resolve, reject } = txQueue.shift();
-  try {
-    const result = await fn();
-    resolve(result);
-  } catch (err) {
-    reject(err);
-  }
+  try { resolve(await fn()); } catch (err) { reject(err); }
   processQueue();
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// ─── SCALING ──────────────────────────────────────────────────────────────────
+// Store all values scaled by 1e18 for consistency.
+// Gas: gwei value * 1e18  (frontend divides by 1e9 to get gwei — so we store gwei*1e9 as wei then *1e9 again... 
+// Actually: frontend does Number(raw)/1e9 for gas. So we need raw = gwei * 1e9.
+// For TXS: frontend does Number(raw)/100. So raw = txCount * 100.
+// For Active Addresses: frontend checks raw > 1e12 then divides by 1e18, else uses raw directly.
+// So Active Addresses: store as plain integer (no scaling needed if count < 1e12).
+
+function toScaledGas(gwei) {
+  // frontend: Number(raw) / 1e9 = gwei  →  raw = gwei * 1e9
+  return BigInt(Math.round(gwei * 1e9));
 }
 
-function toScaled(value) {
-  return BigInt(Math.round(value * 1e4)) * (PRICE_PRECISION / BigInt(1e4));
+function toScaledTxs(count) {
+  // frontend: Number(raw) / 100 = count  →  raw = count * 100
+  return BigInt(Math.round(count * 100));
+}
+
+function toScaledAddresses(count) {
+  // frontend: if raw > 1e12 divide by 1e18, else use raw directly
+  // count is always < 1e12 so store as plain integer
+  return BigInt(Math.round(count));
+}
+
+function toScaled(metricId, value) {
+  switch (metricId) {
+    case Metric.GAS_PRICE:       return toScaledGas(value);
+    case Metric.TXS_PER_BLOCK:   return toScaledTxs(value);
+    case Metric.ACTIVE_ADDRESSES: return toScaledAddresses(value);
+    default: return BigInt(Math.round(value));
+  }
 }
 
 // ─── ROLLING AVERAGES ─────────────────────────────────────────────────────────
@@ -118,14 +125,13 @@ function rollingAverage(arr) {
   return sum / BigInt(arr.length);
 }
 
-// ─── DAILY HIGH / LOW ─────────────────────────────────────────────────────────
+// ─── DAILY STATS ──────────────────────────────────────────────────────────────
 
 let dailyStats = {
   GAS: { high: 0, low: Infinity },
   TXS_PER_BLOCK: { high: 0, low: Infinity },
   ACTIVE_ADDRESSES: { high: 0, low: Infinity }
 };
-
 let lastDayReset = new Date().toISOString().slice(0, 10);
 
 function checkDayReset() {
@@ -137,7 +143,7 @@ function checkDayReset() {
       ACTIVE_ADDRESSES: { high: 0, low: Infinity }
     };
     lastDayReset = today;
-    console.log("Daily high/low reset for new UTC day.");
+    console.log("Daily high/low reset.");
   }
 }
 
@@ -149,26 +155,15 @@ function updateDailyStats(key, value) {
 
 // ─── CACHES ───────────────────────────────────────────────────────────────────
 
-let latestPrices = {
-  GAS: 0,
-  TXS_PER_BLOCK: 0,
-  updatedAt: 0
-};
-
+let latestPrices = { GAS: 0, TXS_PER_BLOCK: 0, updatedAt: 0 };
 let networkFeed = {
-  GAS: 0,
-  GAS_DAILY_HIGH: 0,
-  GAS_DAILY_LOW: 0,
-  TXS_PER_BLOCK: 0,
-  TXS_DAILY_HIGH: 0,
-  TXS_DAILY_LOW: 0,
-  ACTIVE_ADDRESSES: 0,
-  ACTIVE_DAILY_HIGH: 0,
-  ACTIVE_DAILY_LOW: 0,
+  GAS: 0, GAS_DAILY_HIGH: 0, GAS_DAILY_LOW: 0,
+  TXS_PER_BLOCK: 0, TXS_DAILY_HIGH: 0, TXS_DAILY_LOW: 0,
+  ACTIVE_ADDRESSES: 0, ACTIVE_DAILY_HIGH: 0, ACTIVE_DAILY_LOW: 0,
   updatedAt: 0
 };
 
-// ─── SINGLE BLOCK FETCH ───────────────────────────────────────────────────────
+// ─── BLOCK FETCH ──────────────────────────────────────────────────────────────
 
 async function fetchBlockData() {
   try {
@@ -176,7 +171,6 @@ async function fetchBlockData() {
     const res = await fetch(url);
     const data = await res.json();
     const block = data?.result;
-
     if (!block) throw new Error("No block returned");
 
     const baseFeeHex = block.baseFeePerGas || "0x0";
@@ -193,15 +187,10 @@ async function fetchBlockData() {
     }
     const activeCount = addressSet.size > 0 ? addressSet.size : (networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400);
 
-    console.log(`[${new Date().toISOString()}] Block fetch OK`);
-    console.log(`  GAS: ${gasGwei.toFixed(4)} gwei`);
-    console.log(`  TXS PER BLOCK: ${txCount}`);
-    console.log(`  ACTIVE ADDRESSES: ${activeCount}`);
-
+    console.log(`[${new Date().toISOString()}] Block OK | GAS: ${gasGwei.toFixed(4)} | TXS: ${txCount} | ADDR: ${activeCount}`);
     return { gasGwei, txCount, activeCount };
-
   } catch (err) {
-    console.error(`  Block fetch error: ${err.message}`);
+    console.error(`Block fetch error: ${err.message}`);
     return {
       gasGwei: latestPrices.GAS > 0 ? latestPrices.GAS : 0.3,
       txCount: latestPrices.TXS_PER_BLOCK > 0 ? latestPrices.TXS_PER_BLOCK : 200,
@@ -210,11 +199,8 @@ async function fetchBlockData() {
   }
 }
 
-// ─── UPDATE ALL METRICS ───────────────────────────────────────────────────────
-
 async function updateAllMetrics() {
   checkDayReset();
-
   const { gasGwei, txCount, activeCount } = await fetchBlockData();
 
   const gasScaled = BigInt(Math.round(gasGwei * 1e18));
@@ -246,94 +232,91 @@ async function updateAllMetrics() {
     ACTIVE_DAILY_LOW: dailyStats.ACTIVE_ADDRESSES.low === Infinity ? 0 : dailyStats.ACTIVE_ADDRESSES.low,
     updatedAt: Date.now()
   };
-
-  console.log(`  Smoothed GAS: ${latestPrices.GAS.toFixed(4)} | Smoothed TXS: ${latestPrices.TXS_PER_BLOCK.toFixed(1)}`);
-  console.log(`  GAS daily H/L: ${networkFeed.GAS_DAILY_HIGH} / ${networkFeed.GAS_DAILY_LOW}`);
-  console.log(`  TXS daily H/L: ${networkFeed.TXS_DAILY_HIGH} / ${networkFeed.TXS_DAILY_LOW}`);
-  console.log(`  ACTIVE daily H/L: ${networkFeed.ACTIVE_DAILY_HIGH} / ${networkFeed.ACTIVE_DAILY_LOW}`);
 }
-
-// ─── PERPS PRICE PUSH ─────────────────────────────────────────────────────────
 
 async function pushPrices() {
   try {
     const gas = rollingAverage(gasHistory);
     const txs = rollingAverage(txsHistory);
-
-    if (gas === 0n || txs === 0n) {
-      console.log("  Skipping perps push — rolling averages not ready yet.");
-      return;
-    }
-
-    console.log("  Pushing perps to chain...");
+    if (gas === 0n || txs === 0n) { console.log("  Skipping perps push — not ready."); return; }
     const tx = await perpsContract.pushPrices([gas, 1n, txs]);
-    console.log(`  TX sent: ${tx.hash}`);
     await tx.wait();
     console.log("  Perps confirmed.");
-
   } catch (err) {
-    console.error(`  Perps push error (non-fatal): ${err.message?.slice(0, 120)}`);
+    console.error(`  Perps push error: ${err.message?.slice(0, 120)}`);
   }
 }
 
-// ─── PREDICTION ROUND MANAGER ─────────────────────────────────────────────────
+// ─── ROUND TRACKER — rebuilt from chain on startup ────────────────────────────
 
 const roundTracker = {};
 
-function getRoundKey(metric, timeframe) {
-  return `${metric}_${timeframe}`;
-}
+function getRoundKey(metric, timeframe) { return `${metric}_${timeframe}`; }
 
 function getMetricCurrentValue(metricId) {
   switch (metricId) {
-    case Metric.ACTIVE_ADDRESSES:    return networkFeed.ACTIVE_ADDRESSES || 0;
-    case Metric.ETH_LARGE_TRANSFERS: return networkFeed.GAS || 0;
-    case Metric.LIQUIDATION_VOLUME:  return networkFeed.TXS_PER_BLOCK || 0;
+    case Metric.ACTIVE_ADDRESSES: return networkFeed.ACTIVE_ADDRESSES || 0;
+    case Metric.GAS_PRICE:        return networkFeed.GAS || 0;
+    case Metric.TXS_PER_BLOCK:    return networkFeed.TXS_PER_BLOCK || 0;
     default: return 0;
   }
 }
 
 function metricIsReady(metricId) {
-  const value = getMetricCurrentValue(metricId);
-  const threshold = METRIC_THRESHOLDS[metricId] || 0;
-  return value > threshold;
+  return getMetricCurrentValue(metricId) > (METRIC_THRESHOLDS[metricId] || 0);
 }
 
 function getTimeframeDuration(timeframeId) {
-  switch (timeframeId) {
-    case Timeframe.ONE_HOUR:         return 3600;
-    case Timeframe.TWENTY_FOUR_HOUR: return 86400;
-    default: return 3600;
+  return timeframeId === Timeframe.ONE_HOUR ? 3600 : 86400;
+}
+
+// Rebuild roundTracker from chain so restarts don't lose open rounds
+async function rebuildRoundTracker() {
+  console.log("Rebuilding round tracker from chain...");
+  const activeMetrics = [Metric.ACTIVE_ADDRESSES, Metric.GAS_PRICE, Metric.TXS_PER_BLOCK];
+  for (const metricId of activeMetrics) {
+    for (const timeframeId of [Timeframe.ONE_HOUR, Timeframe.TWENTY_FOUR_HOUR]) {
+      try {
+        const latestId = await predictContract.getLatestRound(metricId, timeframeId);
+        if (latestId === 0n) continue;
+        const round = await predictContract.rounds(latestId);
+        const status = Number(round.status);
+        const closeTime = Number(round.closeTime);
+        if (status === RoundStatus.OPEN) {
+          const key = getRoundKey(metricId, timeframeId);
+          roundTracker[key] = { roundId: latestId, closeTime };
+          console.log(`  Recovered round ${latestId} metric ${metricId} tf ${timeframeId} closes in ${closeTime - Math.floor(Date.now()/1000)}s`);
+        }
+        await sleep(200);
+      } catch (e) {
+        console.error(`  Rebuild error metric ${metricId} tf ${timeframeId}: ${e.message?.slice(0, 80)}`);
+      }
+    }
   }
+  console.log("Round tracker rebuilt.");
 }
 
 async function managePredictionRounds() {
   try {
-    console.log(`[${new Date().toISOString()}] Managing prediction rounds...`);
-
-    const activeMetrics = [
-      Metric.ACTIVE_ADDRESSES,
-      Metric.ETH_LARGE_TRANSFERS,
-      Metric.LIQUIDATION_VOLUME
-    ];
+    const activeMetrics = [Metric.ACTIVE_ADDRESSES, Metric.GAS_PRICE, Metric.TXS_PER_BLOCK];
+    const now = Math.floor(Date.now() / 1000);
 
     for (const metricId of activeMetrics) {
       for (const timeframeId of [Timeframe.ONE_HOUR, Timeframe.TWENTY_FOUR_HOUR]) {
         const key = getRoundKey(metricId, timeframeId);
         const tracked = roundTracker[key];
-        const now = Math.floor(Date.now() / 1000);
 
         try {
           if (!tracked) {
+            // No tracked round — check chain
             let latestId;
             try {
               latestId = await predictContract.getLatestRound(metricId, timeframeId);
             } catch (e) {
-              console.error(`  getLatestRound failed metric ${metricId} tf ${timeframeId}: ${e.message?.slice(0, 80)}`);
-              await sleep(300);
+              console.error(`  getLatestRound failed m${metricId} tf${timeframeId}: ${e.message?.slice(0, 80)}`);
               continue;
             }
-            await sleep(300);
+            await sleep(200);
 
             let shouldOpen = false;
 
@@ -345,111 +328,100 @@ async function managePredictionRounds() {
                 round = await predictContract.rounds(latestId);
               } catch (e) {
                 console.error(`  rounds() failed id ${latestId}: ${e.message?.slice(0, 80)}`);
-                await sleep(300);
                 continue;
               }
-              await sleep(300);
+              await sleep(200);
 
               const status = Number(round.status);
               const closeTime = Number(round.closeTime);
 
               if (status === RoundStatus.OPEN && now >= closeTime) {
-                if (!metricIsReady(metricId)) {
-                  console.log(`  Metric ${metricId} not ready — skipping resolve`);
-                  continue;
-                }
-                const endValue = toScaled(getMetricCurrentValue(metricId));
-                try {
-                  await enqueue(async () => {
-                    console.log(`  Resolving round ${latestId} metric ${metricId} tf ${timeframeId}`);
-                    const tx = await predictContract.resolveRound(latestId, endValue);
-                    console.log(`  Resolve TX: ${tx.hash}`);
-                    await tx.wait();
-                    console.log(`  Resolved.`);
-                  });
-                } catch (e) {
-                  console.error(`  Resolve failed (non-fatal): ${e.message?.slice(0, 80)}`);
+                // Overdue open round — resolve it now
+                if (metricIsReady(metricId)) {
+                  const endValue = toScaled(metricId, getMetricCurrentValue(metricId));
+                  try {
+                    await enqueue(async () => {
+                      console.log(`  Resolving overdue round ${latestId} m${metricId} tf${timeframeId}`);
+                      const tx = await predictContract.resolveRound(latestId, endValue);
+                      await tx.wait();
+                      console.log(`  Resolved.`);
+                    });
+                  } catch (e) {
+                    console.error(`  Resolve failed: ${e.message?.slice(0, 80)}`);
+                  }
                 }
                 shouldOpen = true;
               } else if (status === RoundStatus.OPEN && now < closeTime) {
                 roundTracker[key] = { roundId: latestId, closeTime };
-                console.log(`  Round ${latestId} still open — closes in ${closeTime - now}s`);
+                console.log(`  Recovered round ${latestId} m${metricId} tf${timeframeId} closes in ${closeTime - now}s`);
                 continue;
               } else {
+                // Resolved or cancelled — open new
                 shouldOpen = true;
               }
             }
 
-            if (shouldOpen) {
-              if (!metricIsReady(metricId)) {
-                console.log(`  Metric ${metricId} not ready — skipping open`);
-                continue;
-              }
-              const startValue = toScaled(getMetricCurrentValue(metricId));
+            if (shouldOpen && metricIsReady(metricId)) {
+              const startValue = toScaled(metricId, getMetricCurrentValue(metricId));
               const duration = getTimeframeDuration(timeframeId);
               try {
                 await enqueue(async () => {
-                  console.log(`  Opening round metric ${metricId} tf ${timeframeId} startValue ${startValue}`);
+                  console.log(`  Opening round m${metricId} tf${timeframeId} startValue ${startValue}`);
                   const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                  console.log(`  Open TX: ${tx.hash}`);
                   await tx.wait();
                   const newId = await predictContract.getLatestRound(metricId, timeframeId);
-                  roundTracker[key] = { roundId: newId, closeTime: now + duration };
-                  console.log(`  Round opened. ID: ${newId}`);
+                  roundTracker[key] = { roundId: newId, closeTime: Math.floor(Date.now()/1000) + duration };
+                  console.log(`  Opened round ID: ${newId}`);
                 });
               } catch (e) {
-                console.error(`  Open round failed (non-fatal): ${e.message?.slice(0, 80)}`);
+                console.error(`  Open round failed: ${e.message?.slice(0, 80)}`);
               }
             }
 
           } else {
+            // Have tracked round
             if (now >= tracked.closeTime) {
-              console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — time to resolve`);
-              if (!metricIsReady(metricId)) {
-                console.log(`  Metric ${metricId} not ready — skipping resolve`);
-                continue;
-              }
-              const endValue = toScaled(getMetricCurrentValue(metricId));
+              console.log(`  Resolving round ${tracked.roundId} m${metricId} tf${timeframeId}`);
               const duration = getTimeframeDuration(timeframeId);
-              try {
-                await enqueue(async () => {
-                  console.log(`  Resolving round ${tracked.roundId}`);
-                  const tx = await predictContract.resolveRound(tracked.roundId, endValue);
-                  console.log(`  Resolve TX: ${tx.hash}`);
-                  await tx.wait();
-                  console.log(`  Resolved.`);
-                });
-              } catch (e) {
-                console.error(`  Resolve failed (non-fatal): ${e.message?.slice(0, 80)}`);
-              }
-              delete roundTracker[key];
 
               if (metricIsReady(metricId)) {
-                const startValue = toScaled(getMetricCurrentValue(metricId));
-                const nowAfter = Math.floor(Date.now() / 1000);
-                await sleep(4000);
+                const endValue = toScaled(metricId, getMetricCurrentValue(metricId));
                 try {
                   await enqueue(async () => {
-                    console.log(`  Opening next round metric ${metricId} tf ${timeframeId}`);
+                    const tx = await predictContract.resolveRound(tracked.roundId, endValue);
+                    await tx.wait();
+                    console.log(`  Resolved round ${tracked.roundId}.`);
+                  });
+                } catch (e) {
+                  console.error(`  Resolve failed: ${e.message?.slice(0, 80)}`);
+                }
+              }
+
+              delete roundTracker[key];
+              await sleep(3000);
+
+              if (metricIsReady(metricId)) {
+                const startValue = toScaled(metricId, getMetricCurrentValue(metricId));
+                const nowAfter = Math.floor(Date.now() / 1000);
+                try {
+                  await enqueue(async () => {
+                    console.log(`  Opening next round m${metricId} tf${timeframeId}`);
                     const tx = await predictContract.openRound(metricId, timeframeId, startValue);
-                    console.log(`  Open TX: ${tx.hash}`);
                     await tx.wait();
                     const newId = await predictContract.getLatestRound(metricId, timeframeId);
                     roundTracker[key] = { roundId: newId, closeTime: nowAfter + duration };
-                    console.log(`  Round opened. ID: ${newId}`);
+                    console.log(`  Opened round ID: ${newId}`);
                   });
                 } catch (e) {
-                  console.error(`  Open next round failed (non-fatal): ${e.message?.slice(0, 80)}`);
+                  console.error(`  Open next round failed: ${e.message?.slice(0, 80)}`);
                 }
               }
             } else {
-              console.log(`  Round ${tracked.roundId} metric ${metricId} tf ${timeframeId} — closes in ${tracked.closeTime - now}s`);
+              console.log(`  Round ${tracked.roundId} m${metricId} tf${timeframeId} closes in ${tracked.closeTime - now}s`);
             }
           }
-
         } catch (err) {
-          console.error(`  Round manager error metric ${metricId} tf ${timeframeId}: ${err.message?.slice(0, 80)}`);
-          await sleep(300);
+          console.error(`  Round manager error m${metricId} tf${timeframeId}: ${err.message?.slice(0, 80)}`);
         }
       }
     }
@@ -465,20 +437,13 @@ const server = http.createServer((req, res) => {
   res.setHeader("Content-Type", "application/json");
 
   if (req.url === "/") {
-    res.end(JSON.stringify({
-      GAS: latestPrices.GAS,
-      TXS_PER_BLOCK: latestPrices.TXS_PER_BLOCK,
-      updatedAt: latestPrices.updatedAt
-    }));
+    res.end(JSON.stringify({ GAS: latestPrices.GAS, TXS_PER_BLOCK: latestPrices.TXS_PER_BLOCK, updatedAt: latestPrices.updatedAt }));
   } else if (req.url === "/feed") {
     res.end(JSON.stringify(networkFeed));
   } else if (req.url === "/rounds") {
     const out = {};
     for (const [key, val] of Object.entries(roundTracker)) {
-      out[key] = {
-        roundId: val.roundId?.toString(),
-        closeTime: val.closeTime
-      };
+      out[key] = { roundId: val.roundId?.toString(), closeTime: val.closeTime };
     }
     res.end(JSON.stringify(out));
   } else {
@@ -487,24 +452,25 @@ const server = http.createServer((req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Keeper server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Keeper running on port ${PORT}`));
 
-// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log("ChainFlux Keeper starting...");
 
-  console.log("Warming up rolling averages (5 blocks)...");
+  // Warmup rolling averages
+  console.log("Warming up (5 blocks)...");
   for (let i = 0; i < 5; i++) {
     await updateAllMetrics();
     await sleep(3000);
   }
   console.log("Warmup complete.");
 
-  let tick = 0;
+  // Rebuild round tracker from chain — survives restarts
+  await rebuildRoundTracker();
 
+  let tick = 0;
   setInterval(async () => {
     tick++;
     console.log(`\n── Tick ${tick} ──`);
