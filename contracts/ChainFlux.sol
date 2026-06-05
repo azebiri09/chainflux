@@ -7,8 +7,7 @@ import "@openzeppelin/contracts-upgradeable@5.0.2/access/OwnableUpgradeable.sol"
 import "@openzeppelin/contracts-upgradeable@5.0.2/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable@5.0.2/token/ERC20/ERC20Upgradeable.sol";
 
-/// @title ChainFlux V2 — Trade the heartbeat of blockchain
-/// @notice Perpetual trading on live Ethereum blockchain activity, settled on Arbitrum
+/// @title ChainFlux V3 — Trade the heartbeat of blockchain
 contract ChainFlux is
     Initializable,
     UUPSUpgradeable,
@@ -24,17 +23,30 @@ contract ChainFlux is
     uint256 public constant BPS_DENOM = 10_000;
     uint256 public constant MIN_POSITION = 0.001 ether;
     uint256 public constant PRICE_PRECISION = 1e18;
-    uint256 public constant PRICE_STALENESS = 60;        // seconds
-    uint256 public constant LIQ_THRESHOLD_BPS = 8_000;  // 80% of margin lost
-    uint256 public constant LIQ_BONUS_BPS = 500;        // 5% bonus to liquidator
-    uint8   public constant LEVERAGE_LOW = 2;
-    uint8   public constant LEVERAGE_HIGH = 5;
+    uint256 public constant PRICE_STALENESS = 300;
+    uint256 public constant LIQ_THRESHOLD_BPS = 8_000;
+    uint256 public constant LIQ_BONUS_BPS = 500;
+
+    uint256 public constant CFT_MULTIPLIER = 10_000;
+    uint256 public constant WIN_BONUS_MULTIPLIER = 2;
+    uint256 public constant CFT_TOTAL_SUPPLY = 1_000_000_000 * 1e18;
+
+    uint256 public constant TIER_BRONZE  =   5_000 * 1e18;
+    uint256 public constant TIER_SILVER  =  50_000 * 1e18;
+    uint256 public constant TIER_GOLD    = 200_000 * 1e18;
+    uint256 public constant TIER_DIAMOND = 500_000 * 1e18;
+
+    uint8 public constant LEV_UNRANKED = 5;
+    uint8 public constant LEV_BRONZE   = 10;
+    uint8 public constant LEV_SILVER   = 20;
+    uint8 public constant LEV_GOLD     = 25;
+    uint8 public constant LEV_DIAMOND  = 30;
 
     // ─────────────────────────────────────────────
-    // Enums — slot order MUST match original (0,1,2)
+    // Enums
     // ─────────────────────────────────────────────
 
-    enum Market    { GAS, LIQUIDATIONS, STABLECOIN_NETFLOWS }
+    enum Market    { GAS, LIQUIDATIONS, TXS_PER_BLOCK }
     enum Direction { LONG, SHORT }
 
     // ─────────────────────────────────────────────
@@ -48,13 +60,12 @@ contract ChainFlux is
         uint256 shortOI;
     }
 
-    /// @dev New fields (leverage, liquidationPrice) appended at end — safe for upgrade
     struct Position {
         address trader;
         Market market;
         Direction direction;
         uint256 collateral;
-        uint256 size;           // collateral * leverage
+        uint256 size;
         uint256 entryPrice;
         uint256 openedAt;
         uint256 cftMinted;
@@ -64,7 +75,7 @@ contract ChainFlux is
     }
 
     // ─────────────────────────────────────────────
-    // Storage — original slots preserved in order
+    // Storage
     // ─────────────────────────────────────────────
 
     address public feeRecipient;
@@ -74,6 +85,8 @@ contract ChainFlux is
     mapping(address => bool) public isKeeper;
     uint256 public positionCount;
     uint256 public totalFeesCollected;
+    uint256 public cftRewardsPool;
+    bool public v3Initialized;
 
     // ─────────────────────────────────────────────
     // Events
@@ -90,10 +103,11 @@ contract ChainFlux is
         uint256 liquidationPrice,
         uint256 cftMinted
     );
-    event PositionClosed(uint256 indexed id, address indexed trader, int256 pnl, uint256 payout);
+    event PositionClosed(uint256 indexed id, address indexed trader, int256 pnl, uint256 payout, uint256 cftRewarded);
     event PositionLiquidated(uint256 indexed id, address indexed trader, address indexed liquidator, uint256 bonus);
     event KeeperUpdated(address indexed keeper, bool status);
     event FeeRecipientUpdated(address indexed newRecipient);
+    event CFTRewarded(address indexed trader, uint256 amount, bool won);
 
     // ─────────────────────────────────────────────
     // Modifiers
@@ -105,15 +119,8 @@ contract ChainFlux is
     }
 
     modifier validLeverage(uint8 leverage) {
-        require(leverage == LEVERAGE_LOW || leverage == LEVERAGE_HIGH, "ChainFlux: leverage must be 2 or 5");
-        _;
-    }
-
-    modifier freshPrice(Market market) {
-        require(
-            block.timestamp - markets[market].updatedAt <= PRICE_STALENESS,
-            "ChainFlux: price stale"
-        );
+        require(leverage >= 2 && leverage <= 30, "ChainFlux: invalid leverage");
+        require(leverage <= getMaxLeverage(msg.sender), "ChainFlux: leverage exceeds tier");
         _;
     }
 
@@ -127,7 +134,7 @@ contract ChainFlux is
     }
 
     // ─────────────────────────────────────────────
-    // Initializer (proxy only — never called again)
+    // Initializer
     // ─────────────────────────────────────────────
 
     function initialize(
@@ -143,15 +150,49 @@ contract ChainFlux is
     }
 
     // ─────────────────────────────────────────────
-    // Keeper — price feed
+    // V3 Initializer
     // ─────────────────────────────────────────────
 
-    /// @notice Push smoothed prices for all 3 markets
-    /// @param prices [GAS, LIQUIDATIONS, STABLECOIN_NETFLOWS] — all scaled to 1e18
+    function initializeV3(address founderWallet) external onlyOwner {
+        require(!v3Initialized, "ChainFlux: V3 already initialized");
+        require(founderWallet != address(0), "ChainFlux: zero address");
+        v3Initialized = true;
+        uint256 rewardsAmount = 700_000_000 * 1e18;
+        _mint(address(this), rewardsAmount);
+        cftRewardsPool = rewardsAmount;
+        _mint(founderWallet, 300_000_000 * 1e18);
+    }
+
+    // ─────────────────────────────────────────────
+    // Tier System
+    // ─────────────────────────────────────────────
+
+    function getTier(address user) public view returns (uint8) {
+        uint256 bal = balanceOf(user);
+        if (bal >= TIER_DIAMOND) return 4;
+        if (bal >= TIER_GOLD)    return 3;
+        if (bal >= TIER_SILVER)  return 2;
+        if (bal >= TIER_BRONZE)  return 1;
+        return 0;
+    }
+
+    function getMaxLeverage(address user) public view returns (uint8) {
+        uint8 tier = getTier(user);
+        if (tier == 4) return LEV_DIAMOND;
+        if (tier == 3) return LEV_GOLD;
+        if (tier == 2) return LEV_SILVER;
+        if (tier == 1) return LEV_BRONZE;
+        return LEV_UNRANKED;
+    }
+
+    // ─────────────────────────────────────────────
+    // Keeper
+    // ─────────────────────────────────────────────
+
     function pushPrices(uint256[3] calldata prices) external onlyKeeper {
-        _setPrice(Market.GAS,                   prices[0]);
-        _setPrice(Market.LIQUIDATIONS,           prices[1]);
-        _setPrice(Market.STABLECOIN_NETFLOWS,    prices[2]);
+        _setPrice(Market.GAS,           prices[0]);
+        _setPrice(Market.LIQUIDATIONS,  prices[1]);
+        _setPrice(Market.TXS_PER_BLOCK, prices[2]);
     }
 
     function _setPrice(Market m, uint256 price) internal {
@@ -165,10 +206,6 @@ contract ChainFlux is
     // Trading
     // ─────────────────────────────────────────────
 
-    /// @notice Open a leveraged position
-    /// @param marketId  0=GAS, 1=LIQUIDATIONS, 2=STABLECOIN_NETFLOWS
-    /// @param dirId     0=LONG, 1=SHORT
-    /// @param leverage  2 or 5
     function openPosition(
         uint8 marketId,
         uint8 dirId,
@@ -180,32 +217,33 @@ contract ChainFlux is
         validLeverage(leverage)
     {
         require(msg.value >= MIN_POSITION, "ChainFlux: below minimum");
-
-        Market    market    = Market(marketId);
+        Market market = Market(marketId);
         Direction direction = Direction(dirId);
-
         require(markets[market].price > 0, "ChainFlux: no price feed");
         require(
             block.timestamp - markets[market].updatedAt <= PRICE_STALENESS,
             "ChainFlux: price stale"
         );
+        _processOpen(market, direction, leverage);
+    }
 
+    function _processOpen(
+        Market market,
+        Direction direction,
+        uint8 leverage
+    ) internal {
         uint256 fee        = (msg.value * FEE_BPS) / BPS_DENOM;
         uint256 collateral = msg.value - fee;
-        uint256 size       = collateral * leverage;
 
         totalFeesCollected += fee;
         (bool feeOk,) = feeRecipient.call{value: fee}("");
         require(feeOk, "ChainFlux: fee transfer failed");
 
-        uint256 entryPrice      = markets[market].price;
+        uint256 entryPrice       = markets[market].price;
         uint256 liquidationPrice = _computeLiqPrice(entryPrice, leverage, direction);
 
-        uint256 cftAmount = (collateral * PRICE_PRECISION) / entryPrice;
-        _mint(msg.sender, cftAmount);
-
         if (direction == Direction.LONG) {
-            markets[market].longOI  += collateral;
+            markets[market].longOI += collateral;
         } else {
             markets[market].shortOI += collateral;
         }
@@ -216,41 +254,35 @@ contract ChainFlux is
             market:           market,
             direction:        direction,
             collateral:       collateral,
-            size:             size,
+            size:             collateral * leverage,
             entryPrice:       entryPrice,
             openedAt:         block.timestamp,
-            cftMinted:        cftAmount,
+            cftMinted:        0,
             open:             true,
             leverage:         leverage,
             liquidationPrice: liquidationPrice
         });
 
         userPositions[msg.sender].push(id);
-
-        emit PositionOpened(id, msg.sender, market, direction, collateral, leverage, liquidationPrice, cftAmount);
+        emit PositionOpened(id, msg.sender, market, direction, collateral, leverage, liquidationPrice, 0);
     }
 
-    /// @notice Close your own position
     function closePosition(uint256 id) external nonReentrant {
         Position storage pos = positions[id];
-        require(pos.open,               "ChainFlux: position not open");
+        require(pos.open,                 "ChainFlux: position not open");
         require(pos.trader == msg.sender, "ChainFlux: not your position");
-
         uint256 currentPrice = markets[pos.market].price;
         require(currentPrice > 0, "ChainFlux: no price feed");
-
         int256  pnl    = _calculatePnL(pos, currentPrice);
         uint256 payout = _resolvePayout(pos.collateral, pnl);
-
-        _closePosition(id, pos, payout, pnl);
+        uint256 cftReward = _computeCFTReward(pos.collateral, pos.leverage, pnl >= 0);
+        _distributeCFT(msg.sender, cftReward, pnl >= 0);
+        _closePosition(id, pos, payout, pnl, cftReward);
     }
 
-    /// @notice Liquidate an underwater position — anyone can call, earns 5% bonus
     function liquidate(address trader, uint8 marketId) external nonReentrant {
-        // Find the trader's open position for this market
         uint256[] storage ids = userPositions[trader];
         uint256 posId = type(uint256).max;
-
         for (uint256 i = 0; i < ids.length; i++) {
             Position storage p = positions[ids[i]];
             if (p.open && uint8(p.market) == marketId) {
@@ -258,41 +290,50 @@ contract ChainFlux is
                 break;
             }
         }
-
         require(posId != type(uint256).max, "ChainFlux: no open position");
-
         Position storage pos = positions[posId];
         uint256 currentPrice = markets[pos.market].price;
         require(currentPrice > 0, "ChainFlux: no price feed");
-
         require(_isLiquidatable(pos, currentPrice), "ChainFlux: not liquidatable");
-
-        uint256 bonus = (pos.collateral * LIQ_BONUS_BPS) / BPS_DENOM;
+        uint256 bonus     = (pos.collateral * LIQ_BONUS_BPS) / BPS_DENOM;
         uint256 remaining = pos.collateral > bonus ? pos.collateral - bonus : 0;
-
-        // Burn CFT, update OI
-        _burn(pos.trader, pos.cftMinted);
         if (pos.direction == Direction.LONG) {
             markets[pos.market].longOI  -= pos.collateral;
         } else {
             markets[pos.market].shortOI -= pos.collateral;
         }
-
         pos.open = false;
-
-        // Pay liquidator bonus
         if (bonus > 0 && address(this).balance >= bonus) {
             (bool ok,) = msg.sender.call{value: bonus}("");
             require(ok, "ChainFlux: bonus transfer failed");
         }
-
-        // Remaining goes to fee recipient (protocol)
         if (remaining > 0 && address(this).balance >= remaining) {
             (bool ok2,) = feeRecipient.call{value: remaining}("");
             require(ok2, "ChainFlux: remaining transfer failed");
         }
-
         emit PositionLiquidated(posId, trader, msg.sender, bonus);
+    }
+
+    // ─────────────────────────────────────────────
+    // CFT Rewards
+    // ─────────────────────────────────────────────
+
+    function _computeCFTReward(
+        uint256 collateral,
+        uint8 leverage,
+        bool won
+    ) internal pure returns (uint256) {
+        uint256 cft = collateral * leverage * CFT_MULTIPLIER;
+        if (won) cft = cft * WIN_BONUS_MULTIPLIER;
+        return cft;
+    }
+
+    function _distributeCFT(address trader, uint256 amount, bool won) internal {
+        if (amount == 0 || cftRewardsPool == 0) return;
+        uint256 toSend = amount > cftRewardsPool ? cftRewardsPool : amount;
+        cftRewardsPool -= toSend;
+        _transfer(address(this), trader, toSend);
+        emit CFTRewarded(trader, toSend, won);
     }
 
     // ─────────────────────────────────────────────
@@ -301,14 +342,10 @@ contract ChainFlux is
 
     function _computeLiqPrice(
         uint256 entryPrice,
-        uint8   leverage,
+        uint8 leverage,
         Direction direction
     ) internal pure returns (uint256) {
-        // 80% of margin lost = liquidation
-        // For LONG:  liqPrice = entryPrice * (1 - 0.8/leverage)
-        // For SHORT: liqPrice = entryPrice * (1 + 0.8/leverage)
         uint256 movePercent = (LIQ_THRESHOLD_BPS * PRICE_PRECISION) / (BPS_DENOM * leverage);
-
         if (direction == Direction.LONG) {
             return entryPrice - (entryPrice * movePercent / PRICE_PRECISION);
         } else {
@@ -323,7 +360,6 @@ contract ChainFlux is
         int256 pnl = _calculatePnL(pos, currentPrice);
         if (pnl >= 0) return false;
         uint256 loss = uint256(-pnl);
-        // Liquidate when loss >= 80% of collateral
         return loss >= (pos.collateral * LIQ_THRESHOLD_BPS) / BPS_DENOM;
     }
 
@@ -334,7 +370,6 @@ contract ChainFlux is
         int256 entry   = int256(pos.entryPrice);
         int256 current = int256(currentPrice);
         int256 size    = int256(pos.size);
-
         if (pos.direction == Direction.LONG) {
             return (size * (current - entry)) / entry;
         } else {
@@ -358,25 +393,21 @@ contract ChainFlux is
         uint256 id,
         Position storage pos,
         uint256 payout,
-        int256 pnl
+        int256 pnl,
+        uint256 cftRewarded
     ) internal {
-        _burn(pos.trader, pos.cftMinted);
-
         if (pos.direction == Direction.LONG) {
             markets[pos.market].longOI  -= pos.collateral;
         } else {
             markets[pos.market].shortOI -= pos.collateral;
         }
-
         pos.open = false;
-
         if (payout > 0) {
             require(address(this).balance >= payout, "ChainFlux: insufficient balance");
             (bool ok,) = msg.sender.call{value: payout}("");
             require(ok, "ChainFlux: payout failed");
         }
-
-        emit PositionClosed(id, msg.sender, pnl, payout);
+        emit PositionClosed(id, msg.sender, pnl, payout, cftRewarded);
     }
 
     // ─────────────────────────────────────────────
@@ -417,13 +448,29 @@ contract ChainFlux is
     function getAllMarkets() external view returns (
         MarketState memory gas,
         MarketState memory liquidations,
-        MarketState memory stablecoinNetflows
+        MarketState memory txsPerBlock
     ) {
         return (
             markets[Market.GAS],
             markets[Market.LIQUIDATIONS],
-            markets[Market.STABLECOIN_NETFLOWS]
+            markets[Market.TXS_PER_BLOCK]
         );
+    }
+
+    function getTierInfo(address user) external view returns (
+        uint8 tier,
+        uint256 cftBalance,
+        uint8 maxLeverage,
+        uint256 nextTierThreshold
+    ) {
+        tier        = getTier(user);
+        cftBalance  = balanceOf(user);
+        maxLeverage = getMaxLeverage(user);
+        if (tier == 0) nextTierThreshold = TIER_BRONZE;
+        else if (tier == 1) nextTierThreshold = TIER_SILVER;
+        else if (tier == 2) nextTierThreshold = TIER_GOLD;
+        else if (tier == 3) nextTierThreshold = TIER_DIAMOND;
+        else nextTierThreshold = 0;
     }
 
     // ─────────────────────────────────────────────
