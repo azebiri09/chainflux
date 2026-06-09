@@ -111,7 +111,7 @@ async function updateAllMetrics() {
   const { gasGwei, txCount, activeCount } = await fetchBlockData();
 
   const gasScaled = BigInt(Math.round(gasGwei * 1e18));
-  const txsScaled = BigInt(txCount) * PRICE_PRECISION;
+  const txsScaled = BigInt(Math.round(txCount)) * PRICE_PRECISION;
   pushToWindow(gasHistory, gasScaled, GAS_WINDOW);
   pushToWindow(txsHistory, txsScaled, TXS_WINDOW);
   const smoothedGas = rollingAverage(gasHistory);
