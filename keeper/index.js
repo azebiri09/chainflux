@@ -146,7 +146,7 @@ async function fetchMarketData() {
         const latest = tvlData[tvlData.length - 1]?.tvl ?? 0;
         const previous = tvlData[tvlData.length - 2]?.tvl ?? 0;
         if (previous > 0) {
-          tvlChange = ((latest - previous) / previous) * 100;
+          tvlChange = latest - previous;
         }
       }
     } catch { }
