@@ -69,6 +69,7 @@ let networkFeed = {
   GAS: 0, GAS_DAILY_HIGH: 0, GAS_DAILY_LOW: 0,
   TXS_PER_BLOCK: 0, TXS_DAILY_HIGH: 0, TXS_DAILY_LOW: 0,
   ACTIVE_ADDRESSES: 0, ACTIVE_DAILY_HIGH: 0, ACTIVE_DAILY_LOW: 0,
+  TVL_CHANGE: 0,
   updatedAt: 0
 };
 
@@ -106,9 +107,24 @@ async function fetchBlockData() {
   }
 }
 
+async function fetchTVLChange() {
+  try {
+    const res = await fetch("https://api.llama.fi/v2/historicalChainTvl/ethereum");
+    const data = await res.json();
+    if (Array.isArray(data) && data.length >= 2) {
+      const recent = data.slice(-2);
+      return Math.abs((recent[1].tvl ?? 0) - (recent[0].tvl ?? 0));
+    }
+    return 0;
+  } catch {
+    return networkFeed.TVL_CHANGE > 0 ? networkFeed.TVL_CHANGE : 0;
+  }
+}
+
 async function updateAllMetrics() {
   checkDayReset();
   const { gasGwei, txCount, activeCount } = await fetchBlockData();
+  const tvlChange = await fetchTVLChange();
 
   const gasScaled = BigInt(Math.round(gasGwei * 1e18));
   const txsScaled = BigInt(Math.round(txCount)) * PRICE_PRECISION;
@@ -137,6 +153,7 @@ async function updateAllMetrics() {
     ACTIVE_ADDRESSES: activeCount,
     ACTIVE_DAILY_HIGH: dailyStats.ACTIVE_ADDRESSES.high,
     ACTIVE_DAILY_LOW: dailyStats.ACTIVE_ADDRESSES.low === Infinity ? 0 : dailyStats.ACTIVE_ADDRESSES.low,
+    TVL_CHANGE: tvlChange,
     updatedAt: Date.now()
   };
 }
