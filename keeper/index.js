@@ -132,44 +132,51 @@ async function fetchBlockData() {
 
 async function fetchMarketData() {
   const results = await Promise.allSettled([
-    fetch("https://api.coingecko.com/api/v3/global").then(r => r.json()),
+    fetch("https://api.llama.fi/v2/historicalChainTvl/Ethereum").then(r => r.json()),
+    fetch("https://stablecoins.llama.fi/stablecoinchains").then(r => r.json()),
     fetch("https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume").then(r => r.json()),
     fetch("https://api.llama.fi/overview/options/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyNotionalVolume").then(r => r.json()),
   ]);
 
   let tvlChange = networkFeed.TVL_CHANGE;
-  let stablecoinFlows = networkFeed.STABLECOIN_FLOWS;
   if (results[0].status === "fulfilled") {
     try {
-      const global = results[0].value?.data;
-      if (global) {
-        // DeFi TVL change: defi_market_cap * 24h change percentage
-        const defiMarketCap = parseFloat(global.defi_market_cap ?? 0);
-        const marketCapChange = parseFloat(global.market_cap_change_percentage_24h_usd ?? 0);
-        if (defiMarketCap > 0) {
-          tvlChange = Math.abs(defiMarketCap * (marketCapChange / 100));
+      const tvlData = results[0].value;
+      if (Array.isArray(tvlData) && tvlData.length >= 2) {
+        const latest = tvlData[tvlData.length - 1]?.tvl ?? 0;
+        const previous = tvlData[tvlData.length - 2]?.tvl ?? 0;
+        if (previous > 0) {
+          tvlChange = ((latest - previous) / previous) * 100;
         }
+      }
+    } catch { }
+  }
 
-        // Stablecoin flows: stablecoin_market_cap * 24h change percentage
-        const stablecoinMarketCap = parseFloat(global.stablecoin_market_cap ?? 0);
-        if (stablecoinMarketCap > 0) {
-          stablecoinFlows = Math.abs(stablecoinMarketCap * (marketCapChange / 100));
+  let stablecoinFlows = networkFeed.STABLECOIN_FLOWS;
+  if (results[1].status === "fulfilled") {
+    try {
+      const chains = results[1].value;
+      if (Array.isArray(chains)) {
+        const ethereum = chains.find(c => c.name === "Ethereum");
+        if (ethereum) {
+          const pegged = ethereum.totalCirculatingUSD?.peggedUSD ?? 0;
+          stablecoinFlows = parseFloat(pegged);
         }
       }
     } catch { }
   }
 
   let dexVolume = networkFeed.DEX_VOLUME;
-  if (results[1].status === "fulfilled") {
+  if (results[2].status === "fulfilled") {
     try {
-      dexVolume = results[1].value?.total24h ?? networkFeed.DEX_VOLUME;
+      dexVolume = results[2].value?.total24h ?? networkFeed.DEX_VOLUME;
     } catch { }
   }
 
   let liquidations = networkFeed.LIQUIDATIONS;
-  if (results[2].status === "fulfilled") {
+  if (results[3].status === "fulfilled") {
     try {
-      const data = results[2].value;
+      const data = results[3].value;
       liquidations = data?.total24h ?? data?.totalNotionalVolume24h ?? networkFeed.LIQUIDATIONS;
     } catch { }
   }
@@ -178,10 +185,10 @@ async function fetchMarketData() {
   updateDailyStats("STABLECOIN_FLOWS", stablecoinFlows);
   updateDailyStats("LIQUIDATIONS", liquidations);
 
-  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(0)} | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
+  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(2)}% | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
 
   return { tvlChange, dexVolume, stablecoinFlows, liquidations };
-      }
+}
 
 async function updateAllMetrics() {
   checkDayReset();
