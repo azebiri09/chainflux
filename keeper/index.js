@@ -11,6 +11,7 @@ const RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc";
 
 const PRICE_PRECISION = BigInt("1000000000000000000");
 const INTERVAL_MS = 15000;
+const MARKET_INTERVAL_MS = 60000;
 
 const PERPS_ABI = [
   "function pushPrices(uint256[3] calldata prices) external"
@@ -41,7 +42,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 let dailyStats = {
   GAS: { high: 0, low: Infinity },
   TXS_PER_BLOCK: { high: 0, low: Infinity },
-  ACTIVE_ADDRESSES: { high: 0, low: Infinity }
+  ACTIVE_ADDRESSES: { high: 0, low: Infinity },
+  DEX_VOLUME: { high: 0, low: Infinity },
+  STABLECOIN_FLOWS: { high: 0, low: Infinity },
+  LIQUIDATIONS: { high: 0, low: Infinity },
 };
 let lastDayReset = new Date().toISOString().slice(0, 10);
 
@@ -51,7 +55,10 @@ function checkDayReset() {
     dailyStats = {
       GAS: { high: 0, low: Infinity },
       TXS_PER_BLOCK: { high: 0, low: Infinity },
-      ACTIVE_ADDRESSES: { high: 0, low: Infinity }
+      ACTIVE_ADDRESSES: { high: 0, low: Infinity },
+      DEX_VOLUME: { high: 0, low: Infinity },
+      STABLECOIN_FLOWS: { high: 0, low: Infinity },
+      LIQUIDATIONS: { high: 0, low: Infinity },
     };
     lastDayReset = today;
     console.log("Daily high/low reset.");
@@ -60,9 +67,13 @@ function checkDayReset() {
 
 function updateDailyStats(key, value) {
   if (value <= 0) return;
+  if (!dailyStats[key]) return;
   if (value > dailyStats[key].high) dailyStats[key].high = value;
   if (value < dailyStats[key].low) dailyStats[key].low = value;
 }
+
+function getDailyHigh(key) { return dailyStats[key]?.high ?? 0; }
+function getDailyLow(key) { return dailyStats[key]?.low === Infinity ? 0 : (dailyStats[key]?.low ?? 0); }
 
 let latestPrices = { GAS: 0, TXS_PER_BLOCK: 0, updatedAt: 0 };
 let networkFeed = {
@@ -70,6 +81,10 @@ let networkFeed = {
   TXS_PER_BLOCK: 0, TXS_DAILY_HIGH: 0, TXS_DAILY_LOW: 0,
   ACTIVE_ADDRESSES: 0, ACTIVE_DAILY_HIGH: 0, ACTIVE_DAILY_LOW: 0,
   TVL_CHANGE: 0,
+  NET_UTILIZATION: 50,
+  DEX_VOLUME: 0, DEX_VOLUME_HIGH: 1, DEX_VOLUME_LOW: 0,
+  STABLECOIN_FLOWS: 0, STABLECOIN_HIGH: 1, STABLECOIN_LOW: 0,
+  LIQUIDATIONS: 0, LIQUIDATIONS_HIGH: 1, LIQUIDATIONS_LOW: 0,
   updatedAt: 0
 };
 
@@ -95,36 +110,93 @@ async function fetchBlockData() {
     }
     const activeCount = addressSet.size > 0 ? addressSet.size : (networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400);
 
-    console.log(`[${new Date().toISOString()}] Block OK | GAS: ${gasGwei.toFixed(4)} | TXS: ${txCount} | ADDR: ${activeCount}`);
-    return { gasGwei, txCount, activeCount };
+    let utilization = networkFeed.NET_UTILIZATION;
+    if (block.gasUsed && block.gasLimit) {
+      const used = parseInt(block.gasUsed, 16);
+      const limit = parseInt(block.gasLimit, 16);
+      if (limit > 0) utilization = (used / limit) * 100;
+    }
+
+    console.log(`[${new Date().toISOString()}] Block OK | GAS: ${gasGwei.toFixed(4)} | TXS: ${txCount} | ADDR: ${activeCount} | UTIL: ${utilization.toFixed(1)}%`);
+    return { gasGwei, txCount, activeCount, utilization };
   } catch (err) {
     console.error(`Block fetch error: ${err.message}`);
     return {
       gasGwei: latestPrices.GAS > 0 ? latestPrices.GAS : 0.3,
       txCount: latestPrices.TXS_PER_BLOCK > 0 ? latestPrices.TXS_PER_BLOCK : 200,
-      activeCount: networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400
+      activeCount: networkFeed.ACTIVE_ADDRESSES > 0 ? networkFeed.ACTIVE_ADDRESSES : 400,
+      utilization: networkFeed.NET_UTILIZATION,
     };
   }
 }
 
-async function fetchTVLChange() {
-  try {
-    const res = await fetch("https://api.llama.fi/v2/historicalChainTvl/ethereum");
-    const data = await res.json();
-    if (Array.isArray(data) && data.length >= 2) {
-      const recent = data.slice(-2);
-      return Math.abs((recent[1].tvl ?? 0) - (recent[0].tvl ?? 0));
-    }
-    return 0;
-  } catch {
-    return networkFeed.TVL_CHANGE > 0 ? networkFeed.TVL_CHANGE : 0;
+async function fetchMarketData() {
+  const results = await Promise.allSettled([
+    fetch("https://api.llama.fi/v2/historicalChainTvl/ethereum").then(r => r.json()),
+    fetch("https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume").then(r => r.json()),
+    fetch("https://stablecoins.llama.fi/stablecoinchains").then(r => r.json()),
+    fetch("https://api.llama.fi/overview/options/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyNotionalVolume").then(r => r.json()),
+  ]);
+
+  let tvlChange = networkFeed.TVL_CHANGE;
+  if (results[0].status === "fulfilled") {
+    try {
+      const data = results[0].value;
+      if (Array.isArray(data) && data.length >= 2) {
+        const recent = data.slice(-2);
+        tvlChange = Math.abs((recent[1].tvl ?? 0) - (recent[0].tvl ?? 0));
+      }
+    } catch { }
   }
+
+  let dexVolume = networkFeed.DEX_VOLUME;
+  if (results[1].status === "fulfilled") {
+    try {
+      dexVolume = results[1].value?.total24h ?? networkFeed.DEX_VOLUME;
+    } catch { }
+  }
+
+  let stablecoinFlows = networkFeed.STABLECOIN_FLOWS;
+  if (results[2].status === "fulfilled") {
+    try {
+      const chains = results[2].value;
+      if (Array.isArray(chains)) {
+        const eth = chains.find((c) => c.name?.toLowerCase() === "ethereum");
+        const rawChange = eth?.change_1d ?? 0;
+        stablecoinFlows = Math.abs(rawChange);
+        if (stablecoinFlows === 0 && eth?.totalCirculatingUSD?.peggedUSD) {
+          stablecoinFlows = eth.totalCirculatingUSD.peggedUSD * 0.001;
+        }
+        if (stablecoinFlows === 0 && eth?.totalCirculatingUSD) {
+          const total = typeof eth.totalCirculatingUSD === "number"
+            ? eth.totalCirculatingUSD
+            : Object.values(eth.totalCirculatingUSD).reduce((a, b) => a + b, 0);
+          stablecoinFlows = total * 0.001;
+        }
+      }
+    } catch { }
+  }
+
+  let liquidations = networkFeed.LIQUIDATIONS;
+  if (results[3].status === "fulfilled") {
+    try {
+      const data = results[3].value;
+      liquidations = data?.total24h ?? data?.totalNotionalVolume24h ?? networkFeed.LIQUIDATIONS;
+    } catch { }
+  }
+
+  updateDailyStats("DEX_VOLUME", dexVolume);
+  updateDailyStats("STABLECOIN_FLOWS", stablecoinFlows);
+  updateDailyStats("LIQUIDATIONS", liquidations);
+
+  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(0)} | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
+
+  return { tvlChange, dexVolume, stablecoinFlows, liquidations };
 }
 
 async function updateAllMetrics() {
   checkDayReset();
-  const { gasGwei, txCount, activeCount } = await fetchBlockData();
-  const tvlChange = await fetchTVLChange();
+  const { gasGwei, txCount, activeCount, utilization } = await fetchBlockData();
 
   const gasScaled = BigInt(Math.round(gasGwei * 1e18));
   const txsScaled = BigInt(Math.round(txCount)) * PRICE_PRECISION;
@@ -144,17 +216,35 @@ async function updateAllMetrics() {
   };
 
   networkFeed = {
+    ...networkFeed,
     GAS: gasGwei,
-    GAS_DAILY_HIGH: dailyStats.GAS.high,
-    GAS_DAILY_LOW: dailyStats.GAS.low === Infinity ? 0 : dailyStats.GAS.low,
+    GAS_DAILY_HIGH: getDailyHigh("GAS"),
+    GAS_DAILY_LOW: getDailyLow("GAS"),
     TXS_PER_BLOCK: txCount,
-    TXS_DAILY_HIGH: dailyStats.TXS_PER_BLOCK.high,
-    TXS_DAILY_LOW: dailyStats.TXS_PER_BLOCK.low === Infinity ? 0 : dailyStats.TXS_PER_BLOCK.low,
+    TXS_DAILY_HIGH: getDailyHigh("TXS_PER_BLOCK"),
+    TXS_DAILY_LOW: getDailyLow("TXS_PER_BLOCK"),
     ACTIVE_ADDRESSES: activeCount,
-    ACTIVE_DAILY_HIGH: dailyStats.ACTIVE_ADDRESSES.high,
-    ACTIVE_DAILY_LOW: dailyStats.ACTIVE_ADDRESSES.low === Infinity ? 0 : dailyStats.ACTIVE_ADDRESSES.low,
-    TVL_CHANGE: tvlChange,
+    ACTIVE_DAILY_HIGH: getDailyHigh("ACTIVE_ADDRESSES"),
+    ACTIVE_DAILY_LOW: getDailyLow("ACTIVE_ADDRESSES"),
+    NET_UTILIZATION: utilization,
     updatedAt: Date.now()
+  };
+}
+
+async function updateMarketMetrics() {
+  const { tvlChange, dexVolume, stablecoinFlows, liquidations } = await fetchMarketData();
+  networkFeed = {
+    ...networkFeed,
+    TVL_CHANGE: tvlChange,
+    DEX_VOLUME: dexVolume,
+    DEX_VOLUME_HIGH: getDailyHigh("DEX_VOLUME"),
+    DEX_VOLUME_LOW: getDailyLow("DEX_VOLUME"),
+    STABLECOIN_FLOWS: stablecoinFlows,
+    STABLECOIN_HIGH: getDailyHigh("STABLECOIN_FLOWS"),
+    STABLECOIN_LOW: getDailyLow("STABLECOIN_FLOWS"),
+    LIQUIDATIONS: liquidations,
+    LIQUIDATIONS_HIGH: getDailyHigh("LIQUIDATIONS"),
+    LIQUIDATIONS_LOW: getDailyLow("LIQUIDATIONS"),
   };
 }
 
@@ -194,6 +284,7 @@ async function main() {
     await updateAllMetrics();
     await sleep(3000);
   }
+  await updateMarketMetrics();
   console.log("Warmup complete.");
 
   let tick = 0;
@@ -203,6 +294,11 @@ async function main() {
     await updateAllMetrics();
     await pushPrices();
   }, INTERVAL_MS);
+
+  setInterval(async () => {
+    console.log(`\n── Market Data Refresh ──`);
+    await updateMarketMetrics();
+  }, MARKET_INTERVAL_MS);
 }
 
 main().catch(err => {
