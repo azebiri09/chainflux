@@ -181,31 +181,7 @@ async function fetchMarketData() {
   console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(0)} | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
 
   return { tvlChange, dexVolume, stablecoinFlows, liquidations };
-            }
-
-  let dexVolume = networkFeed.DEX_VOLUME;
-  if (results[1].status === "fulfilled") {
-    try {
-      dexVolume = results[1].value?.total24h ?? networkFeed.DEX_VOLUME;
-    } catch { }
-  }
-
-  let liquidations = networkFeed.LIQUIDATIONS;
-  if (results[2].status === "fulfilled") {
-    try {
-      const data = results[2].value;
-      liquidations = data?.total24h ?? data?.totalNotionalVolume24h ?? networkFeed.LIQUIDATIONS;
-    } catch { }
-  }
-
-  updateDailyStats("DEX_VOLUME", dexVolume);
-  updateDailyStats("STABLECOIN_FLOWS", stablecoinFlows);
-  updateDailyStats("LIQUIDATIONS", liquidations);
-
-  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(0)} | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
-
-  return { tvlChange, dexVolume, stablecoinFlows, liquidations };
-}
+      }
 
 async function updateAllMetrics() {
   checkDayReset();
