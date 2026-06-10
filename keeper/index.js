@@ -137,31 +137,51 @@ async function fetchMarketData() {
     fetch("https://api.llama.fi/overview/options/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyNotionalVolume").then(r => r.json()),
   ]);
 
-  // CoinGecko global data — used for both TVL change and stablecoin flows
   let tvlChange = networkFeed.TVL_CHANGE;
   let stablecoinFlows = networkFeed.STABLECOIN_FLOWS;
   if (results[0].status === "fulfilled") {
     try {
       const global = results[0].value?.data;
       if (global) {
-        // DeFi TVL change: total_value_locked_in_defi in USD, use 24h market cap change % as proxy delta
-        const defiMarketCap = global.total_value_locked?.usd ?? 0;
-        const marketCapChange24h = global.market_cap_change_percentage_24h_usd ?? 0;
+        // DeFi TVL change: defi_market_cap * 24h change percentage
+        const defiMarketCap = parseFloat(global.defi_market_cap ?? 0);
+        const marketCapChange = parseFloat(global.market_cap_change_percentage_24h_usd ?? 0);
         if (defiMarketCap > 0) {
-          tvlChange = Math.abs(defiMarketCap * (marketCapChange24h / 100));
+          tvlChange = Math.abs(defiMarketCap * (marketCapChange / 100));
         }
 
-        // Stablecoin flows: stablecoins 24h volume change in USD
-        const stablecoinMarketCap = global.total_market_cap_usd
-          ? (global.market_cap_percentage?.usdt ?? 0) / 100 * global.total_market_cap_usd
-          : 0;
-        const stablecoinChange = global.market_cap_change_percentage_24h_usd ?? 0;
+        // Stablecoin flows: stablecoin_market_cap * 24h change percentage
+        const stablecoinMarketCap = parseFloat(global.stablecoin_market_cap ?? 0);
         if (stablecoinMarketCap > 0) {
-          stablecoinFlows = Math.abs(stablecoinMarketCap * (stablecoinChange / 100));
+          stablecoinFlows = Math.abs(stablecoinMarketCap * (marketCapChange / 100));
         }
       }
     } catch { }
   }
+
+  let dexVolume = networkFeed.DEX_VOLUME;
+  if (results[1].status === "fulfilled") {
+    try {
+      dexVolume = results[1].value?.total24h ?? networkFeed.DEX_VOLUME;
+    } catch { }
+  }
+
+  let liquidations = networkFeed.LIQUIDATIONS;
+  if (results[2].status === "fulfilled") {
+    try {
+      const data = results[2].value;
+      liquidations = data?.total24h ?? data?.totalNotionalVolume24h ?? networkFeed.LIQUIDATIONS;
+    } catch { }
+  }
+
+  updateDailyStats("DEX_VOLUME", dexVolume);
+  updateDailyStats("STABLECOIN_FLOWS", stablecoinFlows);
+  updateDailyStats("LIQUIDATIONS", liquidations);
+
+  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(0)} | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
+
+  return { tvlChange, dexVolume, stablecoinFlows, liquidations };
+            }
 
   let dexVolume = networkFeed.DEX_VOLUME;
   if (results[1].status === "fulfilled") {
