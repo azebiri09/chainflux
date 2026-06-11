@@ -81,6 +81,7 @@ let networkFeed = {
   TXS_PER_BLOCK: 0, TXS_DAILY_HIGH: 0, TXS_DAILY_LOW: 0,
   ACTIVE_ADDRESSES: 0, ACTIVE_DAILY_HIGH: 0, ACTIVE_DAILY_LOW: 0,
   TVL_CHANGE: 0,
+  TVL_VALUE: 0,
   NET_UTILIZATION: 50,
   DEX_VOLUME: 0, DEX_VOLUME_HIGH: 1, DEX_VOLUME_LOW: 0,
   STABLECOIN_FLOWS: 0, STABLECOIN_HIGH: 1, STABLECOIN_LOW: 0,
@@ -139,6 +140,7 @@ async function fetchMarketData() {
   ]);
 
   let tvlChange = networkFeed.TVL_CHANGE;
+  let tvlValue = networkFeed.TVL_VALUE;
   if (results[0].status === "fulfilled") {
     try {
       const chains = results[0].value;
@@ -146,6 +148,7 @@ async function fetchMarketData() {
         const ethereum = chains.find(c => c.name === "Ethereum");
         if (ethereum) {
           tvlChange = parseFloat(ethereum.change_1d ?? 0);
+          tvlValue = parseFloat(ethereum.tvl ?? 0);
         }
       }
     } catch { }
@@ -184,9 +187,9 @@ async function fetchMarketData() {
   updateDailyStats("STABLECOIN_FLOWS", stablecoinFlows);
   updateDailyStats("LIQUIDATIONS", liquidations);
 
-  console.log(`[${new Date().toISOString()}] Market data OK | TVL: ${tvlChange.toFixed(2)}% | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
+  console.log(`[${new Date().toISOString()}] Market data OK | TVL: $${(tvlValue / 1e9).toFixed(2)}B ${tvlChange.toFixed(2)}% | DEX: ${dexVolume.toFixed(0)} | STABLE: ${stablecoinFlows.toFixed(0)} | LIQ: ${liquidations.toFixed(0)}`);
 
-  return { tvlChange, dexVolume, stablecoinFlows, liquidations };
+  return { tvlChange, tvlValue, dexVolume, stablecoinFlows, liquidations };
 }
 
 async function updateAllMetrics() {
@@ -227,10 +230,11 @@ async function updateAllMetrics() {
 }
 
 async function updateMarketMetrics() {
-  const { tvlChange, dexVolume, stablecoinFlows, liquidations } = await fetchMarketData();
+  const { tvlChange, tvlValue, dexVolume, stablecoinFlows, liquidations } = await fetchMarketData();
   networkFeed = {
     ...networkFeed,
     TVL_CHANGE: tvlChange,
+    TVL_VALUE: tvlValue,
     DEX_VOLUME: dexVolume,
     DEX_VOLUME_HIGH: getDailyHigh("DEX_VOLUME"),
     DEX_VOLUME_LOW: getDailyLow("DEX_VOLUME"),
