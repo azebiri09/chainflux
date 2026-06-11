@@ -132,7 +132,7 @@ async function fetchBlockData() {
 
 async function fetchMarketData() {
   const results = await Promise.allSettled([
-    fetch("https://api.llama.fi/v2/historicalChainTvl/Ethereum").then(r => r.json()),
+    fetch("https://api.llama.fi/v2/chains").then(r => r.json()),
     fetch("https://stablecoins.llama.fi/stablecoinchains").then(r => r.json()),
     fetch("https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume").then(r => r.json()),
     fetch("https://api.llama.fi/overview/options/ethereum?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyNotionalVolume").then(r => r.json()),
@@ -141,12 +141,11 @@ async function fetchMarketData() {
   let tvlChange = networkFeed.TVL_CHANGE;
   if (results[0].status === "fulfilled") {
     try {
-      const tvlData = results[0].value;
-      if (Array.isArray(tvlData) && tvlData.length >= 2) {
-        const latest = tvlData[tvlData.length - 1]?.tvl ?? 0;
-        const previous = tvlData[tvlData.length - 2]?.tvl ?? 0;
-        if (previous > 0) {
-          tvlChange = latest - previous;
+      const chains = results[0].value;
+      if (Array.isArray(chains)) {
+        const ethereum = chains.find(c => c.name === "Ethereum");
+        if (ethereum) {
+          tvlChange = parseFloat(ethereum.change_1d ?? 0);
         }
       }
     } catch { }
